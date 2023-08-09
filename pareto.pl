@@ -41,20 +41,26 @@ sub parse_nplet($score) {
 }
 
 sub mask_to_list($mask) {
-	return grep { ($mask >> $_) & 1 } 0..7;
+	return grep { ($mask >> $_) & 1 } 0..11;
 }
 
 sub mask_to_letters($mask) {
-	my @letters = qw(T C G A I H W R)[mask_to_list($mask)];
+	my @letters = qw(T C G A I H W L R A H W)[mask_to_list($mask)];
 	local $" = '';
 	return $#letters ? "(@letters)" : "@letters";
 }
+
+my $MASK_V = 255;
+my $MASK_INF = 3861;
 
 sub get_masks() {
 	return sort {
 		mask_to_list($a) <=> mask_to_list($b) ||
 		$a <=> $b
-	} (1, map { 2 * $_ } 1..127);
+	} grep {
+		!(($_ & ~$MASK_V) && ($_ & ~$MASK_INF)) &&
+		!(($_ & 129) && ($_ & ($_ - 1)))
+	} 1..4095;
 }
 
 memoize($_) for qw(mask_to_list mask_to_letters get_masks);
@@ -268,7 +274,7 @@ sub expand_instructions(@parts) {
 		my $just_repeated = 1;
 		my $trackloop = 0;
 
-		if ($instrs =~ /a/i) {
+		if ($instrs =~ /A/i) {
 			my $point = [ $part->{x}, $part->{y} ];
 			my $track = first { $_->{track} and any { point_eq($_, $point) } $_->{track}->@* } @parts;
 			$trackloop = $track->{loops} ? $track->{track}->@* : 9999;
@@ -368,25 +374,25 @@ sub normalize($parts) {
 			$part->{y} -= $part->{rotation} > 3;
 			$part->{rotation} %= 3;
 		}
+
 		if ($name eq 'track') {
+			my $track = $part->{track};
 			my ($xfx, $xfy, $yfx, $yfy) = $xy_rotations[$part->{rotation}]->@*;
-			my %points = ();
 			map {
 				my ($x, $y) = @$_;
 				$_->[0] = $x * $xfx + $y * $xfy;
 				$_->[1] = $x * $yfx + $y * $yfy;
-				++$points{"@$_"};
-			} $part->{track}->@*;
+			} @$track;
 
+			my %points = map { ("@$_" => 1) } @$track;
 			my @arms_on_track = grep { $points{"@$_{qw(x y)}"} } @arms;
-			if (0 < sum map { $_->{instructions} =~ /a/i ? (ord($&) - 81) * 2**-$-[0] : 0 } @arms_on_track) {
+			if (0 < sum map { $_->{instructions} =~ /A/i ? (ord($&) - 81) * 2**-$-[0] : 0 } @arms_on_track) {
 				$_->{instructions} =~ y/Aa/aA/ for @arms_on_track;
-				$part->{track} = [reverse $part->{track}->@*];
+				@$track = reverse @$track;
 			}
 
 			# TODO normalize loop start point
-
-			($part->{x}, $part->{y}) = $part->{track}->[0]->@*;
+			@$part{qw(x y)} = $track->[0]->@*;
 			$part->{rotation} = 0;
 		}
 	}
@@ -426,7 +432,6 @@ sub minify($parts, $initial_score) {
 
 	return 1 if cycles(omsim(@$parts)) <= cycles($initial_score);
 
-	# TODO handle this without omsim modifications
 	$_->{instructions} = $old_instrs;
 	return 1 if $old_instrs =~ /\w/ and cycles(omsim(@$parts)) <= cycles($initial_score);
 
@@ -518,7 +523,6 @@ sub merge_tracks($a, $b) {
 
 	$a->{track} = [@pre, @a, @post];
 	$b->{deleted} = 1;
-	# TODO handle loops
 }
 
 sub handle_overlap($a, $b, %map) {
@@ -535,7 +539,7 @@ sub handle_overlap($a, $b, %map) {
 		return merge_tracks($a, $b);
 	}
 
-	elsif ($a_is_arm && $b_is_arm) {
+	if ($a_is_arm && $b_is_arm) {
 		return if $a->{size} != $b->{size};
 		return if $a->{instructions} ne $b->{instructions};
 		my $handles = 1;
@@ -547,20 +551,16 @@ sub handle_overlap($a, $b, %map) {
 		} else {
 			$a->{part_name} = "arm$handles";
 		}
-		$b->{deleted} = 1;
+		return $b->{deleted} = 1;
 	}
 
-	else {
-		return 1 if ($a_is_track && $b_is_arm) || ($a_is_arm && $b_is_track);
-		return if $a_name ne $b_name;
-		return if $a->{rotation} != $b->{rotation};
-		return if $a->{x} != $b->{x} || $a->{y} != $b->{y};
-		$b->{deleted} = 1;
-		# TODO bonder+bonder => bonder-speed?
-		# TODO bonder+bonder-speed => delete bonder?
-	}
-
-	return 1;
+	return 1 if ($a_is_track && $b_is_arm) || ($a_is_arm && $b_is_track);
+	return if $a_name ne $b_name;
+	return if $a->{rotation} != $b->{rotation};
+	return if $a->{x} != $b->{x} || $a->{y} != $b->{y};
+	# TODO bonder+bonder => bonder-speed?
+	# TODO bonder+bonder-speed => delete bonder?
+	return $b->{deleted} = 1;
 }
 
 sub deoverlap($parts) {
@@ -621,13 +621,13 @@ sub try_all_merges($a, $b) {
 sub save_and_check(@parts) {
 	state %known_bad = (
 		swonL_bs9JyzdqmZ6LT1Og => 1,
-		NTVk5zcKLZINbEQpBc_I0w => 1,
 	);
 
 	my $solution = parts_to_solution(@parts);
 	my $md5 = md5_base64($solution) =~ y(/)(_)r;
-	return if $known_bad{$md5};
-	# return if -f "normalized/$md5.solution";
+	say $md5, return if $known_bad{$md5};
+	return $md5;
+	return if -f "normalized/$md5.solution";
 	write_file("normalized/$md5.solution", $solution, 1);
 
 	normalize(\@parts);
@@ -643,13 +643,88 @@ sub save_and_check(@parts) {
 sub save_if_pareto($context, $solve) {
 	my $pretty = pop @$solve;
 	my $nplet = [$pretty =~ /[\d.]+/g];
-	my ($goodV, @tiesV) = is_pareto($nplet, 255, $context);
-	my ($goodINF, @tiesINF) = is_pareto($nplet, 3861, $context);
+	my ($goodV, @tiesV) = is_pareto($nplet, $MASK_V, $context);
+	my ($goodINF, @tiesINF) = is_pareto($nplet, $MASK_INF, $context);
 	# say $pretty if $goodV or $goodINF;
 	return unless ($goodV and @tiesV == 0) or ($goodINF and @tiesINF == 0);
 	my @names = name($nplet, $context);
 	say "$pretty: ", join ', ', @names;
 	write_file("merged/$pretty.solution", parts_to_solution(@$solve), 1);
+}
+
+sub fold_tracked_arms($parts) {
+	for (@$parts) {
+		next unless $_->{part_name} eq 'track';
+		my %points = map { ("@$_" => 1) } $_->{track}->@*;
+		my @arms_on_track = grep { $points{"@$_{qw(x y)}"} } @$parts;
+		next if @arms_on_track != 1;
+		$arms_on_track[0]->{track} = $_->{track};
+		$_->{deleted} = 1;
+	}
+	@$parts = grep { !$_->{deleted} } @$parts;
+}
+
+sub unfold_tracked_arms($parts) {
+	for (@$parts) {
+		next unless $_->{track} && $_->{part_name} ne 'track';
+		push @$parts, {
+			part_name => 'track',
+			x => $_->{x},
+			y => $_->{y},
+			size => 1,
+			rotation => 0,
+			instructions => '',
+			track => $_->{track},
+		};
+		delete $_->{track};
+	}
+}
+
+sub part_variants($part) {
+	my ($name, $x, $y, $size, $rotation, $instrs, $track) =
+		@$part{qw(part_name x y size rotation instructions track)};
+	return if $instrs !~ /\w/;
+
+	my @variants = ();
+
+	if ($track) {
+	}
+
+	return @variants if $instrs =~ /A/i;
+
+	if ($name =~ /arm([236])/ && !$track) {
+		push @variants, map {{
+			part_name => 'arm1',
+			x => $x,
+			y => $y,
+			size => $size,
+			rotation => $rotation,
+		}} 1..$1;
+	}
+
+	# if ($name =~ /arm[1236]
+
+	if ($name eq 'piston') {
+	}
+
+	return @variants;
+}
+
+sub variantify(@parts) {
+	@parts = deep_copy(@parts);
+	fold_tracked_arms(\@parts);
+	my @variants = ();
+
+	for my $i (0..$#parts) {
+		for my $part_variant (part_variants($parts[$i])) {
+			my @variant = deep_copy(@parts);
+			$variant[$i] = $part_variant;
+			unfold_tracked_arms(\@variant);
+			push @variants, \@variant;
+		}
+	}
+
+	return @variants;
 }
 
 ########
@@ -658,7 +733,6 @@ sub save_if_pareto($context, $solve) {
 if ($h) {
 	say "-u: update solution list";
 	say "-n: name solutions";
-	say "-o: output sorted names";
 	say "-g: generate halves";
 	say "-m: merge halves";
 	exit;
@@ -676,31 +750,36 @@ my @nplets = map {
 	$nplet;
 } @solves;
 
-say 0+@nplets, " paretos";
+warn 0+@nplets, " paretos";
+
+# TODO go back to 8-plets, 9-plets tops
+# say nplet_to_filename(@$_) for
+	# sort { $$a[8] <=> $$b[8] }
+	# grep {
+		# ($$_[9] != 99999 and $$_[9] != $$_[3]) or
+		# ($$_[10] != 99999 and $$_[10] != $$_[5]) or
+		# ($$_[11] != 99999 and $$_[11] != $$_[6]);
+	# } @nplets;
 
 if ($n) {
-	open my $fh, '>', 'names.txt';
-	say $fh "$solves[$_]{fullFormattedScore}: ", join ' ', name($nplets[$_], \@nplets) for 0..$#nplets;
-}
-
-if ($o) {
-	my %names = ();
-	open my $fh, '<', 'names.txt';
-	while (<$fh>) {
-		my ($key, $names) = /(.*?): (.*)/;
-		my @names = split ' ', $names;
-		@names = grep { my $this = $_; any { is_substring($_, $this) } @names } @names;
+	for (0..$#nplets) {
+		my @names = name($nplets[$_], \@nplets, ~$MASK_V);
+		@names = name($nplets[$_], \@nplets, ~$MASK_INF) if !@names;
+		@names = grep { my $this = $_; !any { is_substring($_, $this) } @names } @names;
 		@names = sort { compare_names($a, $b) } @names;
-		$names{$key} = \@names;
+		$solves[$_]{names} = \@names;
 	}
-
-	for (sort { compare_names($names{$a}[0], $names{$b}[0]) } keys %names) {
-		say "$_: ", join ', ', @{$names{$_}};
+	for (sort { compare_names($$a{names}[0], $$b{names}[0]) } @solves) {
+		say "$$_{fullFormattedScore}: @{$$_{names}}";
 	}
+	# for (sort { $$a{lastModified} cmp $$b{lastModified} } grep { $$_{lastModified} } @solves) {
+		# say "$$_{fullFormattedScore}: @{$$_{names}} $$_{lastModified}";
+	# }
 }
 
 if ($g) {
-	my %halves = ();
+	my %old_md5 = map { /\/(.*?)\./; $1 => 1 } <normalized/*.solution>;
+	my %new_md5 = ();
 
 	for my $file (<{solution,extra_solutions}/*.solution>) {
 		my @parts = solution_to_parts(slurp($file, 1));
@@ -709,7 +788,7 @@ if ($g) {
 		my @halves = halvify(@parts);
 
 		normalize($_) for @halves;
-		save_and_check(@$_) for @halves;
+		++$new_md5{$_} for map { save_and_check(@$_) } @halves;
 
 		if (@inputs == 1) {
 			die if @halves != 1;
@@ -731,6 +810,9 @@ if ($g) {
 			}
 		}
 	}
+
+	warn "new md5: $_" for grep { !$old_md5{$_} } keys %new_md5;
+	warn "old md5: $_" for grep { !$new_md5{$_} } keys %old_md5;
 }
 
 if ($m) {
@@ -738,48 +820,8 @@ if ($m) {
 
 	for (0..$#halves) {
 		my $a = $halves[$_];
-		save_if_pareto(\@nplets, $_) for map { try_all_merges($_, $a) } @halves[$_..$#halves];
+		save_if_pareto(\@nplets, $_) for map { try_all_merges($a, $_) } @halves[$_..$#halves];
 		mirror_parts($a);
-		save_if_pareto(\@nplets, $_) for map { try_all_merges($_, $a) } @halves[$_..$#halves];
+		save_if_pareto(\@nplets, $_) for map { try_all_merges($a, $_) } @halves[$_..$#halves];
 	}
 }
-
-# my @halves = map [ solution_to_parts(slurp($_, 1)) ], <test{1,2}.solution>;
-# normalize $_ for @halves;
-# mirror_parts($halves[0]);
-# try_all_merges([], $halves[1], $halves[0]);
-# try_all_merges([], $halves[0], $halves[1]);
-
-# for my $file (<solution/*g15c*.solution>) {
-	# my @parts = solution_to_parts(slurp($file, 1));
-	# for (halvify(@parts)) {
-		# normalize($_);
-		# say $file, " => ", md5_base64(parts_to_solution(@$_)) =~ y(/)(_)r;
-	# }
-# }
-
-# for my $file (<{solution/195g16c21a24i6h4w2r.solution,solution/210g17c24a22i5h4w2r.solution}>) {
-	# my @parts = solution_to_parts(slurp($file, 1));
-	# ($_) = halvify(@parts);
-	# say md5_base64(parts_to_solution(@$_)) =~ y(/)(_)r;
-	# normalize($_);
-	# say Dumper $_->[-1];
-	# say md5_base64(parts_to_solution(@$_)) =~ y(/)(_)r;
-# }
-
-# for my $file (<solution/195g16c21a24i6h4w2r.solution>) {
-	# my @parts = solution_to_parts(slurp($file, 1));
-	# for (halvify(@parts)) {
-		# normalize($_);
-		# say md5_base64(parts_to_solution(@$_)) =~ y(/)(_)r;
-	# }
-# }
-
-# for my $file (<normalized/*.solution>) {
-	# my @parts = solution_to_parts(slurp($file, 1));
-	# my $nplet = omsim(@parts);
-	# $_->{instructions} = '' for @parts;
-	# my $solution = parts_to_solution(@parts);
-	# my $md5 = md5_base64($solution) =~ y(/)(_)r;
-	# say "$md5 $nplet $file";
-# }
