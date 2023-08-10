@@ -5,13 +5,13 @@ use v5.36;
 use warnings;
 use Data::Dumper;
 use Digest::MD5 qw(md5_base64);
-use Memoize;
-use List::Util qw(min max any all sum product first);
-use JSON qw(decode_json);
 use IPC::Open3;
+use JSON qw(decode_json);
+use List::Util qw(min max any all sum product first uniq);
+use Memoize;
 
 
-our ($h, $u, $n, $o, $g, $m);
+our ($h, $u, $n, $g, $m, $v);
 
 sub slurp($filename, $binmode = 0) {
 	open my $fh, '<', $filename;
@@ -93,7 +93,7 @@ sub get_suffix($nplet, $mask, $context) {
 	return 'ˣ' if all { $product <= product @$_[@metrics] } @$context;
 }
 
-sub name($nplet, $context, $ban_mask = 0) {
+sub name_impl($nplet, $context, $ban_mask) {
 	return "" if @$context == 0 or (@$context == 1 and $context->[0] == $nplet);
 
 	my @good_masks = ();
@@ -109,11 +109,20 @@ sub name($nplet, $context, $ban_mask = 0) {
 			$letters .= get_suffix($nplet, $mask, $context) // '';
 			$future_ban_mask |= $mask if ($mask & ($mask - 1)) == 0;
 			push @good_masks, $mask;
-			push @good_names, "$letters$_" for name($nplet, \@ties, $ban_mask | $mask | $future_ban_mask);
+			push @good_names, "$letters$_" for name_impl($nplet, \@ties, $ban_mask | $mask | $future_ban_mask);
 		}
 	}
 
 	return @good_names;
+}
+
+sub name($nplet, $context) {
+	my @names = name_impl($nplet, $context, ~$MASK_V);
+	# TODO more clever @V <=> @INF prioritization
+	# @names = name($nplet, $context, ~$MASK_INF) if !@names;
+	push @names, name_impl($nplet, $context, ~$MASK_INF);
+	@names = grep { my $this = $_; !any { is_substring($_, $this) } @names } @names;
+	@names = sort { compare_names($a, $b) } @names;
 }
 
 sub compare_names($a, $b) {
@@ -177,7 +186,7 @@ sub solution_to_parts($sol) {
 
 			my $dx = $track[-1][0] - $track[0][0];
 			my $dy = $track[-1][1] - $track[0][1];
-			$result->{loops} = @track > 2 && abs($dx) <= 1 && abs($dy) <= 1 && abs($dx + $dy) <= 1;
+			$result->{loops} = 1 if @track > 2 && abs($dx) <= 1 && abs($dy) <= 1 && abs($dx + $dy) <= 1;
 		}
 
 		(my ($armnum), $sol) = unpack 'La*', $sol;
@@ -218,21 +227,25 @@ sub translate_parts($parts, $dx, $dy) {
 
 my @xy_rotations = (
 	[ 1,  0,  0,  1],
-	[ 0, -1,  1,  1],
-	[-1, -1,  1,  0],
+	[ 0,  1, -1,  1],
+	[-1,  1, -1,  0],
 	[-1,  0,  0, -1],
-	[ 0,  1, -1, -1],
-	[ 1,  1, -1,  0],
+	[ 0, -1,  1, -1],
+	[ 1, -1,  1,  0],
 );
 
 sub rotate_parts($parts, $rotation) {
-	my ($xfx, $xfy, $yfx, $yfy) = @{$xy_rotations[$rotation]};
+	my ($xfx, $yfx, $xfy, $yfy) = $xy_rotations[$rotation]->@*;
 	for my $part (@$parts) {
 		$part->{rotation} += $rotation;
 		my ($x, $y) = ($part->{x}, $part->{y});
 		$part->{x} = $x * $xfx + $y * $xfy;
 		$part->{y} = $x * $yfx + $y * $yfy;
 	}
+}
+
+sub rotation_from_point($dx, $dy) {
+	return first { point_eq($xy_rotations[$_], [$dx, $dy]) } 0..5;
 }
 
 sub mirror_parts($parts) {
@@ -370,14 +383,14 @@ sub normalize($parts) {
 		my $name = $part->{part_name};
 		$part->{rotation} %= ($rotational_symmetry{$name} // 6);
 		if (($name =~ /^(?:un)?bonder$/) && $part->{rotation} >= 3) {
-			$part->{x} += $part->{rotation} - 4;
-			$part->{y} -= $part->{rotation} > 3;
+			$part->{x} += $xy_rotations[$part->{rotation}][0];
+			$part->{y} += $xy_rotations[$part->{rotation}][1];
 			$part->{rotation} %= 3;
 		}
 
 		if ($name eq 'track') {
 			my $track = $part->{track};
-			my ($xfx, $xfy, $yfx, $yfy) = $xy_rotations[$part->{rotation}]->@*;
+			my ($xfx, $yfx, $xfy, $yfy) = $xy_rotations[$part->{rotation}]->@*;
 			map {
 				my ($x, $y) = @$_;
 				$_->[0] = $x * $xfx + $y * $xfy;
@@ -488,7 +501,7 @@ sub part_points($part) {
 	my @result = [$part->{x}, $part->{y}];
 
 	if ($part->{part_name} =~ /^(?:out-std|bonder|debonder|bonder-speed)$/) {
-		my ($xfx, $xfy, $yfx, $yfy) = @{$xy_rotations[$part->{rotation} % 6]};
+		my ($xfx, $yfx, $xfy, $yfy) = $xy_rotations[$part->{rotation} % 6]->@*;
 		push @result, [$part->{x} + $xfx, $part->{y} + $yfx];
 		if ($part->{part_name} eq 'bonder-speed') {
 			push @result, [$part->{x} - $xfx + $xfy, $part->{y} + - $yfx + $yfy];
@@ -542,14 +555,14 @@ sub handle_overlap($a, $b, %map) {
 	if ($a_is_arm && $b_is_arm) {
 		return if $a->{size} != $b->{size};
 		return if $a->{instructions} ne $b->{instructions};
-		my $handles = 1;
+		my $grippers = 1;
 		my $dr = $b->{rotation} - $a->{rotation};
-		$handles *= 2 if $a_name =~ /^arm[26]$/ or $b_name =~ /^arm[26]$/ or $dr % 2;
-		$handles *= 3 if $a_name =~ /^arm[36]$/ or $b_name =~ /^arm[36]$/ or $dr % 3;
+		$grippers *= 2 if $a_name =~ /^arm[26]$/ or $b_name =~ /^arm[26]$/ or $dr % 2;
+		$grippers *= 3 if $a_name =~ /^arm[36]$/ or $b_name =~ /^arm[36]$/ or $dr % 3;
 		if ($a_name eq 'piston' or $b_name eq 'piston') {
-			return if $handles > 1;
+			return if $grippers > 1;
 		} else {
-			$a->{part_name} = "arm$handles";
+			$a->{part_name} = "arm$grippers";
 		}
 		return $b->{deleted} = 1;
 	}
@@ -626,8 +639,7 @@ sub save_and_check(@parts) {
 	my $solution = parts_to_solution(@parts);
 	my $md5 = md5_base64($solution) =~ y(/)(_)r;
 	say $md5, return if $known_bad{$md5};
-	return $md5;
-	return if -f "normalized/$md5.solution";
+	return $md5 if -f "normalized/$md5.solution";
 	write_file("normalized/$md5.solution", $solution, 1);
 
 	normalize(\@parts);
@@ -638,6 +650,7 @@ sub save_and_check(@parts) {
 		write_file("test/$md5_new.solution", $solution_new, 1);
 		die "non-idempotent normalization: $md5 => $md5_new";
 	}
+	return $md5;
 }
 
 sub save_if_pareto($context, $solve) {
@@ -653,10 +666,11 @@ sub save_if_pareto($context, $solve) {
 }
 
 sub fold_tracked_arms($parts) {
+	my @arms = grep { $_->{instructions} =~ /\w/ } @$parts;
 	for (@$parts) {
 		next unless $_->{part_name} eq 'track';
 		my %points = map { ("@$_" => 1) } $_->{track}->@*;
-		my @arms_on_track = grep { $points{"@$_{qw(x y)}"} } @$parts;
+		my @arms_on_track = grep { $points{"@$_{qw(x y)}"} } @arms;
 		next if @arms_on_track != 1;
 		$arms_on_track[0]->{track} = $_->{track};
 		$_->{deleted} = 1;
@@ -680,31 +694,189 @@ sub unfold_tracked_arms($parts) {
 	}
 }
 
+sub arm1_for_move($grab_x, $grab_y, $dx, $dy, $clockwise, $instructions) {
+	my $rotation = rotation_from_point(-$dx, -$dy);
+	$rotation = $rotation + ($clockwise ? -1 : 1);
+	my ($xfx, $yfx) = $xy_rotations[$rotation % 6]->@*;
+	return {
+		part_name => 'arm1',
+		x => $grab_x - $xfx,
+		y => $grab_y - $yfx,
+		size => 1,
+		rotation => $rotation,
+		instructions => $instructions,
+	}
+}
+
 sub part_variants($part) {
-	my ($name, $x, $y, $size, $rotation, $instrs, $track) =
+	my ($name, $x, $y, $size, $rotation, $instructions, $track) =
 		@$part{qw(part_name x y size rotation instructions track)};
-	return if $instrs !~ /\w/;
+
+	my @active_instrs = $instructions =~ /G([^g]+)g/g;
+	return if uniq(@active_instrs) != 1;
+	my $active_instrs = $active_instrs[0];
+
+	my ($xfx, $yfx) = $xy_rotations[$rotation]->@*;
+	my $grab_x = $x + $size * $xfx;
+	my $grab_y = $y + $size * $yfx;
 
 	my @variants = ();
 
 	if ($track) {
+		return if $active_instrs =~ /[ER]/i;
+		return if @$track > 3;
+		my $dx = $$track[1][0] - $$track[0][0];
+		my $dy = $$track[1][1] - $$track[0][1];
+		return if $$track[2] && $$track[2][0] - $$track[1][0] != $dx;
+		return if $$track[2] && $$track[2][1] - $$track[1][1] != $dy;
+
+		my $rotation = rotation_from_point($dx, $dy);
+		my ($xfx, $yfx) = $xy_rotations[$rotation]->@*;
+
+		for my $size (1 .. 4-@$track) {
+			push @variants, {
+				part_name => 'piston',
+				x => $grab_x - $size * $xfx,
+				y => $grab_y - $size * $yfx,
+				size => $size,
+				rotation => $rotation,
+				instructions => $instructions =~ y/Aa/Ee/r,
+			};
+		}
+		for my $size (@$track .. 3) {
+			push @variants, {
+				part_name => 'piston',
+				x => $grab_x + $size * $xfx,
+				y => $grab_y + $size * $yfx,
+				size => $size,
+				rotation => $rotation + 3,
+				instructions => $instructions =~ y/Aa/eE/r,
+			};
+		}
+
+		if (@$track == 2) {
+			push @variants, arm1_for_move($grab_x, $grab_y, $dx, $dy, 1, $instructions =~ y/Aa/Rr/r);
+			push @variants, arm1_for_move($grab_x, $grab_y, $dx, $dy, 0, $instructions =~ y/Aa/rR/r);
+		}
 	}
 
-	return @variants if $instrs =~ /A/i;
+	if ($name eq 'piston' and $active_instrs !~ /[AR]/i) {
+		my $long = $active_instrs =~ /E[^e]*E|e[^E]*e/;
+		my $push = $active_instrs =~ /^[^e]*E/;
+		my $dx = $push ? $xfx : -$xfx;
+		my $dy = $push ? $yfx : -$yfx;
 
-	if ($name =~ /arm([236])/ && !$track) {
+		for my $rotation (0..5) {
+			my ($xfx, $yfx) = $xy_rotations[$rotation]->@*;
+			for my $size (1..3) {
+				my $x = $grab_x - $size * $xfx;
+				my $y = $grab_y - $size * $yfx;
+				push @variants, {
+					part_name => 'arm1',
+					x => $x,
+					y => $y,
+					size => $size,
+					rotation => $rotation,
+					instructions => $push ? ($instructions =~ y/Ee/Aa/r) : ($instructions =~ y/Ee/aA/r),
+					track => [map { [$x + $_ * $dx, $y + $_ * $dy] } 0 .. ($long ? 2 : 1)],
+				}
+			}
+		}
+
+		if (!$long) {
+			push @variants, arm1_for_move($grab_x, $grab_y, $dx, $dy,  $push, $instructions =~ y/Ee/Rr/r);
+			push @variants, arm1_for_move($grab_x, $grab_y, $dx, $dy, !$push, $instructions =~ y/Ee/rR/r);
+		}
+	}
+
+	if ($name =~ /^arm([236])$/ and $active_instrs !~ /A/i) {
 		push @variants, map {{
 			part_name => 'arm1',
 			x => $x,
 			y => $y,
 			size => $size,
-			rotation => $rotation,
+			rotation => $rotation + $_ * (6 / $1),
+			instructions => $instructions =~ y/g/X/r,
 		}} 1..$1;
 	}
 
-	# if ($name =~ /arm[1236]
+	if ($name eq 'arm1' and $active_instrs =~ /R/i) {
+		my $dr = ($active_instrs =~ y/R//) - ($active_instrs =~ y/r//);
+		my $grippers = ($dr % 2 ? 2 : 1) * ($dr % 3 ? 3 : 1);
+		if ($grippers != 1) {
+			# TODO version without noops?
+			push @variants, {
+				part_name => "arm$grippers",
+				x => $x,
+				y => $y,
+				size => $size,
+				rotation => $rotation,
+				instructions => $instructions =~ s(g\K[^gG]*)($&=~y/Rr/OO/r)erg,
+			}
+		}
+	}
 
-	if ($name eq 'piston') {
+	# TODO pivot arms => pivot from different positions
+
+	if ($name eq 'arm1' and $size == 1 and $active_instrs =~ /^[Pp]*[Rr][Pp]*$/) {
+		my $clockwise = $active_instrs =~ /^[^r]*R/;
+		my $normed_instrs = $clockwise ? $instructions : ($instructions =~ y/Rr/rR/r);
+		my $movement_rotation = $rotation + ($clockwise ? -2 : 2);
+		my ($dx, $dy) = $xy_rotations[$movement_rotation % 6]->@*;
+
+		# TODO 2-rotate arm => RE/eR piston or bent 3-track
+
+		for my $size (1..2) {
+			push @variants, {
+				part_name => 'piston',
+				x => $grab_x - $size * $dx,
+				y => $grab_y - $size * $dy,
+				size => $size,
+				rotation => $movement_rotation,
+				instructions => $normed_instrs =~ y/Rr/Ee/r,
+			};
+		}
+		for my $size (2..3) {
+			push @variants, {
+				part_name => 'piston',
+				x => $grab_x + $size * $dx,
+				y => $grab_y + $size * $dy,
+				size => $size,
+				rotation => $movement_rotation + 3,
+				instructions => $normed_instrs =~ y/Rr/eE/r,
+			};
+		}
+
+		for my $rotation (0..5) {
+			my ($xfx, $yfx) = $xy_rotations[$rotation]->@*;
+			for my $size (1..3) {
+				my $x = $grab_x - $size * $xfx;
+				my $y = $grab_y - $size * $yfx;
+				push @variants, {
+					part_name => 'arm1',
+					x => $x,
+					y => $y,
+					size => $size,
+					rotation => $rotation,
+					instructions => $normed_instrs =~ y/Rr/Aa/r,
+					track => [[$x, $y], [$x + $dx, $y + $dy]],
+				}
+			}
+		}
+	}
+
+	if ($active_instrs =~ /^R$/i) {
+		my $clockwise = $active_instrs eq 'R';
+		my $end_rotation = $rotation + ($clockwise ? -1 : 1);
+		my ($xfx, $yfx) = $xy_rotations[$end_rotation % 6]->@*;
+		push @variants, {
+			part_name => $name,
+			x => $grab_x + $size * $xfx,
+			y => $grab_y + $size * $yfx,
+			size => $size,
+			rotation => $end_rotation + 3,
+			instructions => $instructions =~ y/Rr/rR/r,
+		}
 	}
 
 	return @variants;
@@ -712,6 +884,7 @@ sub part_variants($part) {
 
 sub variantify(@parts) {
 	@parts = deep_copy(@parts);
+	normalize(\@parts);
 	fold_tracked_arms(\@parts);
 	my @variants = ();
 
@@ -720,7 +893,10 @@ sub variantify(@parts) {
 			my @variant = deep_copy(@parts);
 			$variant[$i] = $part_variant;
 			unfold_tracked_arms(\@variant);
-			push @variants, \@variant;
+			next unless deoverlap(\@variant);
+			my $pretty = omsim(@variant);
+			push @variants, [@variant, $pretty] if $pretty;
+			# push @variants, [@variant, "fail"] if !$pretty;
 		}
 	}
 
@@ -735,17 +911,17 @@ if ($h) {
 	say "-n: name solutions";
 	say "-g: generate halves";
 	say "-m: merge halves";
+	say "-v: variantify";
 	exit;
 }
 
 wget('https://zlbb.faendir.com/om/puzzle/P007/records?includeFrontier=true', 'data.json', $u);
 
-my @solves = grep { !$_->{score}->{overlap} } @{ decode_json(slurp('data.json') =~ s(·|/∞r|@∞)()gr) };
+my @solves = grep { !$_->{score}->{overlap} } decode_json(slurp('data.json') =~ s(·|/∞r|@∞)()gr)->@*;
 
 my @nplets = map {
 	my $nplet = parse_nplet($_->{score});
 	my $file_name = nplet_to_filename(@$nplet);
-	wget($_->{gif}, "gif/$file_name.gif") if $u;
 	wget($_->{solution}, "solution/$file_name.solution") if $u;
 	$nplet;
 } @solves;
@@ -762,19 +938,13 @@ warn 0+@nplets, " paretos";
 	# } @nplets;
 
 if ($n) {
-	for (0..$#nplets) {
-		my @names = name($nplets[$_], \@nplets, ~$MASK_V);
-		@names = name($nplets[$_], \@nplets, ~$MASK_INF) if !@names;
-		@names = grep { my $this = $_; !any { is_substring($_, $this) } @names } @names;
-		@names = sort { compare_names($a, $b) } @names;
-		$solves[$_]{names} = \@names;
-	}
-	for (sort { compare_names($$a{names}[0], $$b{names}[0]) } @solves) {
+	$solves[$_]{names} = [name($nplets[$_], \@nplets)] for 0..$#nplets;
+	# for (sort { compare_names($$a{names}[0], $$b{names}[0]) } @solves) {
+		# say "$$_{fullFormattedScore}: @{$$_{names}}";
+	# }
+	for (sort { $$a{lastModified} cmp $$b{lastModified} } grep { $$_{lastModified} } @solves) {
 		say "$$_{fullFormattedScore}: @{$$_{names}}";
 	}
-	# for (sort { $$a{lastModified} cmp $$b{lastModified} } grep { $$_{lastModified} } @solves) {
-		# say "$$_{fullFormattedScore}: @{$$_{names}} $$_{lastModified}";
-	# }
 }
 
 if ($g) {
@@ -802,6 +972,7 @@ if ($g) {
 			push @attempts, try_all_merges($halves[0], $halves[1]);
 			push @attempts, try_all_merges($halves[1], $halves[0]);
 			mirror_parts($halves[0]);
+			# TODO simplify this
 			if (!any { $_->[-1] eq $goal } @attempts) {
 				say "attempts = ", 0+@attempts;
 				say $_->[-1] for @attempts;
@@ -823,5 +994,26 @@ if ($m) {
 		save_if_pareto(\@nplets, $_) for map { try_all_merges($a, $_) } @halves[$_..$#halves];
 		mirror_parts($a);
 		save_if_pareto(\@nplets, $_) for map { try_all_merges($a, $_) } @halves[$_..$#halves];
+	}
+}
+
+if ($v) {
+	my $file = '/home/grimy/Games/solutions/stabilized-water-134.solution';
+	my @parts = solution_to_parts(slurp($file, 1));
+	# for my $variant (variantify(@parts)) {
+		# say pop @$variant;
+		# my $solution = parts_to_solution(@$variant);
+		# my $md5 = md5_base64($solution) =~ y(/)(_)r;
+		# write_file("test/$md5.solution", $solution, 1);
+	# }
+	for my $file (<{solution,extra_solutions,variants}/*.solution>) {
+		my @parts = solution_to_parts(slurp($file, 1));
+		for my $variant (variantify(@parts)) {
+			save_if_pareto(\@nplets, $variant);
+			my $solution = parts_to_solution(@$variant);
+			my $md5 = md5_base64($solution) =~ y(/)(_)r;
+			next if -f "variants/$md5.solution";
+			write_file("variants/$md5.solution", $solution, 1);
+		}
 	}
 }
