@@ -84,6 +84,15 @@ sub is_pareto($this, $mask, $context) {
 	return 1, @ties;
 }
 
+sub count_outparetos($this, $mask, $context) {
+	my @metrics = mask_to_list($mask);
+	my $result = 0;
+	for my $that (@$context) {
+		++$result if all { $that->[$_] <= $this->[$_] } @metrics;
+	}
+	return $result;
+}
+
 sub get_suffix($nplet, $mask, $context) {
 	return '' if ($mask & ($mask - 1)) == 0;
 	my @metrics = mask_to_list($mask);
@@ -336,6 +345,10 @@ sub expand_instructions(@parts) {
 	}
 }
 
+sub tape_length(@parts) {
+	return max map { $_->{instructions} =~ /\w.*/ ? $+[0] - $-[0] : 0 } @parts;
+}
+
 sub normalize($parts) {
 	expand_instructions(@$parts);
 	my $tape_length = tape_length(@$parts);
@@ -417,10 +430,6 @@ sub deep_copy(@parts) {
 		$_->{track} = [map [ @$_ ], $_->{track}->@*] if $_->{track};
 		$_;
 	} @parts;
-}
-
-sub tape_length(@parts) {
-	return max map { $_->{instructions} =~ /\w.*/ ? $+[0] - $-[0] : 0 } @parts;
 }
 
 sub omsim(@parts) {
@@ -590,21 +599,41 @@ sub deoverlap($parts) {
 }
 
 sub try_merge($half_a, $half_b) {
-	my @reference = deep_copy(@$half_a, @$half_b);
+	my @merged = deep_copy(@$half_a, @$half_b);
+	my $pretty = omsim(@merged) if deoverlap(\@merged);
+	return [@merged, $pretty] if $pretty;
 
-	for (0..3) {
-		if ($_) {
-			$_->{instructions} =~ s/(?=\w)/\0/ for @reference[@$half_a..$#reference];
-		}
-		my @merged = deep_copy(@reference);
+	my @result = ();
+	my @delayed = deep_copy(@$half_a);
+
+	for (1..3) {
+		$_->{instructions} =~ s/(?=\w)/\0/ for @delayed;
+		@merged = deep_copy(@delayed, @$half_b);
 		next unless deoverlap(\@merged);
-		my $pretty = omsim(@merged);
-		return [@merged, $pretty] if $pretty;
+		$pretty = omsim(@merged);
+		if ($pretty) {
+			push @result, [@merged, $pretty];
+			last;
+		}
 	}
 
-	return;
+	@delayed = deep_copy(@$half_b);
+
+	for (1..3) {
+		$_->{instructions} =~ s/(?=\w)/\0/ for @delayed;
+		@merged = deep_copy(@$half_a, @delayed);
+		next unless deoverlap(\@merged);
+		$pretty = omsim(@merged);
+		if ($pretty) {
+			push @result, [@merged, $pretty];
+			last;
+		}
+	}
+
+	return @result;
 }
 
+# TODO use better variable names here
 sub try_all_merges($a, $b) {
 	my $ola = tape_length(@$a);
 	my $olb = tape_length(@$b);
@@ -651,18 +680,6 @@ sub save_and_check(@parts) {
 		die "non-idempotent normalization: $md5 => $md5_new";
 	}
 	return $md5;
-}
-
-sub save_if_pareto($context, $solve) {
-	my $pretty = pop @$solve;
-	my $nplet = [$pretty =~ /[\d.]+/g];
-	my ($goodV, @tiesV) = is_pareto($nplet, $MASK_V, $context);
-	my ($goodINF, @tiesINF) = is_pareto($nplet, $MASK_INF, $context);
-	# say $pretty if $goodV or $goodINF;
-	return unless ($goodV and @tiesV == 0) or ($goodINF and @tiesINF == 0);
-	my @names = name($nplet, $context);
-	say "$pretty: ", join ', ', @names;
-	write_file("merged/$pretty.solution", parts_to_solution(@$solve), 1);
 }
 
 sub fold_tracked_arms($parts) {
@@ -816,7 +833,21 @@ sub part_variants($part) {
 		}
 	}
 
-	# TODO pivot arms => pivot from different positions
+	if ($name eq 'arm1' and $active_instrs =~ /^P$/i) {
+		for my $rotation (0..5) {
+			my ($xfx, $yfx) = $xy_rotations[$rotation]->@*;
+			for my $size (1..3) {
+				push @variants, {
+					part_name => 'arm1',
+					x => $grab_x - $size * $xfx,
+					y => $grab_y - $size * $yfx,
+					size => $size,
+					rotation => $rotation,
+					instructions => $instructions,
+				}
+			}
+		}
+	}
 
 	if ($name eq 'arm1' and $size == 1 and $active_instrs =~ /^[Pp]*[Rr][Pp]*$/) {
 		my $clockwise = $active_instrs =~ /^[^r]*R/;
@@ -919,14 +950,21 @@ wget('https://zlbb.faendir.com/om/puzzle/P007/records?includeFrontier=true', 'da
 
 my @solves = grep { !$_->{score}->{overlap} } decode_json(slurp('data.json') =~ s(·|/∞r|@∞)()gr)->@*;
 
+my %good = ();
+
 my @nplets = map {
 	my $nplet = parse_nplet($_->{score});
 	my $file_name = nplet_to_filename(@$nplet);
+	$good{"solution/$file_name.solution"} = 1;
 	wget($_->{solution}, "solution/$file_name.solution") if $u;
 	$nplet;
 } @solves;
 
 warn 0+@nplets, " paretos";
+
+# for my $file (<solution/*.solution>) {
+	# say $file if !$good{$file};
+# }
 
 # TODO go back to 8-plets, 9-plets tops
 # say nplet_to_filename(@$_) for
@@ -967,18 +1005,11 @@ if ($g) {
 		}
 		elsif (@halves == 2) {
 			my @attempts = try_all_merges($halves[0], $halves[1]);
-			push @attempts, try_all_merges($halves[1], $halves[0]);
 			mirror_parts($halves[0]);
 			push @attempts, try_all_merges($halves[0], $halves[1]);
-			push @attempts, try_all_merges($halves[1], $halves[0]);
 			mirror_parts($halves[0]);
-			# TODO simplify this
-			if (!any { $_->[-1] eq $goal } @attempts) {
-				say "attempts = ", 0+@attempts;
-				say $_->[-1] for @attempts;
-				say md5_base64(parts_to_solution(@$_)) =~ y(/)(_)r for @halves;
-				die $file;
-			}
+			@attempts = map { $_->[-1] } @attempts;
+			die join "\n", $goal, @attempts if !any { $_ eq $goal } @attempts;
 		}
 	}
 
@@ -986,34 +1017,51 @@ if ($g) {
 	warn "old md5: $_" for grep { !$new_md5{$_} } keys %old_md5;
 }
 
-if ($m) {
+if ($v) {
+	my %known = ();
+	my @q = ([]);
 	my @halves = map [solution_to_parts(slurp($_, 1))], <normalized/*.solution>;
+
+	sub postprocess($parts) {
+		my $pretty = pop @$parts;
+		normalize($parts);
+		my $solution = parts_to_solution(@$parts);
+		my $md5 = md5_base64(parts_to_solution(@$parts)) =~ y(/)(_)r;
+		return if $known{$md5}++;
+		my $nplet = [$pretty =~ /[\d.]+/g];
+		my $outV = count_outparetos($nplet, $MASK_V, \@nplets);
+		my $outINF = count_outparetos($nplet, $MASK_INF, \@nplets);
+		my $true_outs = min($outV, $outINF);
+		push $q[$true_outs]->@*, $parts if $true_outs < 32;
+		return if $true_outs;
+		my @names = name($nplet, \@nplets);
+		say "$pretty: ", join ', ', @names;
+		write_file("/home/grimy/Games/solutions/$pretty.solution", $solution, 1);
+		push @nplets, $nplet;
+	}
+
+	for my $file (<{solution,extra_solutions}/*.solution>) {
+		my @parts = solution_to_parts(slurp($file, 1));
+		push @parts, omsim(@parts);
+		postprocess(\@parts);
+	}
+
+	warn "merging...";
 
 	for (0..$#halves) {
 		my $a = $halves[$_];
-		save_if_pareto(\@nplets, $_) for map { try_all_merges($a, $_) } @halves[$_..$#halves];
+		postprocess($_) for map { try_all_merges($a, $_) } @halves[$_..$#halves];
 		mirror_parts($a);
-		save_if_pareto(\@nplets, $_) for map { try_all_merges($a, $_) } @halves[$_..$#halves];
+		postprocess($_) for map { try_all_merges($a, $_) } @halves[$_..$#halves];
 	}
-}
 
-if ($v) {
-	my $file = '/home/grimy/Games/solutions/stabilized-water-134.solution';
-	my @parts = solution_to_parts(slurp($file, 1));
-	# for my $variant (variantify(@parts)) {
-		# say pop @$variant;
-		# my $solution = parts_to_solution(@$variant);
-		# my $md5 = md5_base64($solution) =~ y(/)(_)r;
-		# write_file("test/$md5.solution", $solution, 1);
-	# }
-	for my $file (<{solution,extra_solutions,variants}/*.solution>) {
-		my @parts = solution_to_parts(slurp($file, 1));
-		for my $variant (variantify(@parts)) {
-			save_if_pareto(\@nplets, $variant);
-			my $solution = parts_to_solution(@$variant);
-			my $md5 = md5_base64($solution) =~ y(/)(_)r;
-			next if -f "variants/$md5.solution";
-			write_file("variants/$md5.solution", $solution, 1);
+	warn "variantifying...";
+
+	while (1) {
+		my $parts = shift((first { @$_ } @q)->@*);
+		last if !$parts;
+		for my $variant (variantify(@$parts)) {
+			postprocess($variant);
 		}
 	}
 }
