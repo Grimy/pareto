@@ -511,8 +511,16 @@ sub minify($parts, $cycles) {
 
 	if ($old_name =~ /^arm([236])$/ and $old_instrs !~ /R/i) {
 		$_->name = 'arm1';
-		for my $i (1..$1) {
+		for my $unused (1..$1) {
 			$_->rotation += 6 / $1;
+			return 1 if is_not_slower($parts, $cycles);
+		}
+	}
+
+	if ($old_name eq 'bonder-speed') {
+		$_->name = 'bonder';
+		for my $unused (1..3) {
+			$_->rotation += 2;
 			return 1 if is_not_slower($parts, $cycles);
 		}
 	}
@@ -626,6 +634,12 @@ sub track_eq($a, $b) {
 	return all { point_eq($$a[$_], $$b[$_]) } 0..max($#$a, $#$b);
 }
 
+sub handle_tribonder_overlap($bonder, $tribonder) {
+	my %tribonder_point = map { ("@$_" => 1) } part_points($tribonder);
+	return unless all { $tribonder_point{"@$_"} } part_points($bonder);
+	return $bonder->deleted = 1;
+}
+
 sub handle_overlap($a, $b, $parts) {
 	return 1 if $a->deleted;
 	my ($a_is_track, $a_is_arm) = ($a->name eq 'track', $a->name =~ /^(?:arm[1236]|piston)$/);
@@ -669,11 +683,27 @@ sub handle_overlap($a, $b, $parts) {
 	}
 
 	return 1 if ($a_is_track && $b_is_arm) || ($a_is_arm && $b_is_track);
+	return handle_tribonder_overlap($a, $b) if $a->name eq 'bonder' && $b->name eq 'bonder-speed';
+	return handle_tribonder_overlap($b, $a) if $b->name eq 'bonder' && $a->name eq 'bonder-speed';
 	return if $a->name ne $b->name;
+
+	if ($a->name eq 'bonder') {
+		my %a_point = map { ("@$_" => 1) } part_points($a);
+		my @common_points = grep { $a_point{"@$_"} } part_points($b);
+		return $b->deleted = 1 if @common_points == 2;
+		die if @common_points != 1;
+		my $point = $common_points[0];
+		my $rotation_for_a = ($a->rotation & 1) ^ !point_eq($point, [$a->x, $a->y]);
+		my $rotation_for_b = ($b->rotation & 1) ^ !point_eq($point, [$b->x, $b->y]);
+		return if $rotation_for_a != $rotation_for_b;
+		$a->name = 'bonder-speed';
+		($a->x, $a->y) = @$point;
+		$a->rotation = $rotation_for_a;
+		return $b->deleted = 1;
+	}
+
 	return if $a->rotation != $b->rotation;
 	return if $a->x != $b->x || $a->y != $b->y;
-	# TODO bonder+bonder => bonder-speed?
-	# TODO bonder+bonder-speed => delete bonder?
 	return $b->deleted = 1;
 }
 
@@ -1055,7 +1085,6 @@ if ($g) {
 	my %old_md5 = map { /\/(.*?)\./; $1 => 1 } <normalized/*.solution>;
 	my %new_md5 = ();
 
-	# for my $file (<test.solution>) {
 	for my $file (<{solution,extra_solutions}/*.solution>) {
 		my @parts = solution_to_parts(slurp($file, 1));
 		my $goal = omsim(\@parts);
