@@ -11,19 +11,30 @@ use List::Util qw(min max any all sum product first uniq);
 use Memoize;
 
 
-our ($h, $u, $n, $g, $m, $v);
+our ($h, $u, $n, $g, $v);
+
+# TODO automate removing instructions past C score
 
 package Part {
 	sub new(@args) { return bless [@args], "Part" }
-	sub name :lvalue ($self)         { $self->[0] }
-	sub x :lvalue ($self)            { $self->[1] }
-	sub y :lvalue ($self)            { $self->[2] }
-	sub size :lvalue ($self)         { $self->[3] }
-	sub rotation :lvalue ($self)     { $self->[4] }
-	sub instructions :lvalue ($self) { $self->[5] }
-	sub track :lvalue ($self)        { $self->[6] }
-	sub loops :lvalue ($self)        { $self->[7] }
-	sub deleted :lvalue ($self)      { $self->[8] }
+	sub name :lvalue ($self)         { $$self[0] }
+	sub x :lvalue ($self)            { $$self[1] }
+	sub y :lvalue ($self)            { $$self[2] }
+	sub size :lvalue ($self)         { $$self[3] }
+	sub rotation :lvalue ($self)     { $$self[4] }
+	sub instructions :lvalue ($self) { $$self[5] }
+	sub track :lvalue ($self)        { $$self[6] }
+	sub loops :lvalue ($self)        { $$self[7] }
+	sub deleted :lvalue ($self)      { $$self[8] }
+	sub xy ($self)                   { "@$self[1, 2]" }
+	sub pretty($self) {
+		my $result = "$$self[0] @[$$self[1], $$self[2]] size=$$self[3] rotation=$$self[4]";
+		$result .= ' instructions=' . $$self[5] =~ y/\0/./r if $$self[5];
+		$result .= ' track=' . join ', ', map "[$$_[0], $$_[1]]", $$self[6]->@* if $$self[6];
+		$result .= ' loops' if $$self[7];
+		$result .= ' deleted' if $$self[8];
+		return $result;
+	}
 }
 
 sub slurp($filename, $binmode = 0) {
@@ -318,8 +329,10 @@ sub expand_instructions(@parts) {
 
 			if ($_ eq 'C') {
 				$just_repeated = 1;
-				vec($instrs, $pos++, 8) = vec($instrs, $_, 8) for $repeat_start..$repeat_end;
-				--$pos;
+				my $repeat_string = substr($instrs, $repeat_start, $repeat_end - $repeat_start + 1);
+				$repeat_string ||= 'O';
+				substr($instrs, $pos, length($repeat_string)) = $repeat_string;
+				$pos += length($repeat_string) - 1;
 				%state = (E => 0, R => 0, A => 0);
 				next;
 			}
@@ -341,8 +354,9 @@ sub expand_instructions(@parts) {
 					$reset_string .= $amount > 0 ? 'a' x $amount : 'A' x -$amount;
 				}
 				$reset_string .= 'E' x -$state{E} if $state{E} < 0;
-				vec($instrs, $pos++, 8) = ord $& while $reset_string =~ /./g;
-				--$pos;
+				$reset_string ||= 'O';
+				substr($instrs, $pos, length($reset_string)) = $reset_string;
+				$pos += length($reset_string) - 1;
 				%state = (E => 0, R => 0, A => 0);
 			}
 
@@ -358,13 +372,24 @@ sub tape_length(@parts) {
 	return max map { $_->instructions =~ /\w.*/ ? $+[0] - $-[0] : 0 } @parts;
 }
 
+sub execute_instruction($arm, $i, $track, $loops) {
+	$arm->size = min(3, $arm->size + 1) if $i eq 'E';
+	$arm->size = max(1, $arm->size - 1) if $i eq 'e';
+	$arm->rotation = ($arm->rotation - 1) % 6 if $i eq 'R';
+	$arm->rotation = ($arm->rotation + 1) % 6 if $i eq 'r';
+	if ($i =~ /A/i) {
+		my $track_pos = first { point_eq($$track[$_], [$arm->x, $arm->y]) } 0..$#$track;
+		$track_pos += $i eq 'A' ? 1 : -1;
+		$track_pos = $loops ? $track_pos % @$track : max(0, min($#$track, $track_pos));
+		($arm->x, $arm->y) = $track->[$track_pos]->@*;
+	}
+}
+
 sub normalize($parts) {
 	expand_instructions(@$parts);
 	my $tape_length = tape_length(@$parts);
 	@$parts = grep { $_->name ne 'glyph-marker' } @$parts;
 	my @arms = grep { $_->instructions =~ /\w/ } @$parts;
-	my $start_delay = min map { $_->instructions =~ /\w/; $-[0] } @arms;
-	$_->instructions = substr($_->instructions, $start_delay) for @arms;
 
 	for (5, 4, 3, 2) {
 		next if $tape_length % $_;
@@ -420,7 +445,16 @@ sub normalize($parts) {
 			} @$track;
 
 			my %points = map { ("@$_" => 1) } @$track;
-			my @arms_on_track = grep { $points{"@$_[1, 2]"} } @arms;
+			my @arms_on_track = grep { $points{$_->xy} } @arms;
+
+			if (@arms_on_track == 1) {
+				my $arm = $arms_on_track[0];
+				while ($arm->instructions =~ s/^\0*+\K[^G]/\0/) {
+					vec($arm->instructions, $-[0] + $tape_length, 8) = ord $&;
+					execute_instruction($arm, $&, $part->track, $part->loops);
+				}
+			}
+
 			if (0 < sum map { $_->instructions =~ /A/i ? (ord($&) - 81) * 2**-$-[0] : 0 } @arms_on_track) {
 				$_->instructions =~ y/Aa/aA/ for @arms_on_track;
 				@$track = reverse @$track;
@@ -433,6 +467,9 @@ sub normalize($parts) {
 			$part->rotation = 0;
 		}
 	}
+
+	my $start_delay = min map { $_->instructions =~ /\w/; $-[0] } @arms;
+	$_->instructions = substr($_->instructions, $start_delay) for @arms;
 }
 
 sub deep_copy(@parts) {
@@ -469,6 +506,8 @@ sub minify($parts, $cycles) {
 
 	$_->instructions = $old_instrs;
 	return 1 if $old_instrs =~ /\w/ and is_not_slower($parts, $cycles);
+
+	# TODO minify loop length
 
 	if ($old_name =~ /^arm([236])$/ and $old_instrs !~ /R/i) {
 		$_->name = 'arm1';
@@ -520,9 +559,18 @@ sub add_repeats($parts, $period) {
 }
 
 my %part_points = (
-	bonder => [[1, 0]],
-	debonder => [[1, 0]],
+	'glyph-life-and-death' => [[1, 0], [0, 1], [1, -1]],
+	'bonder' => [[1, 0]],
+	'bonder-prisma' => [[1, 0], [0, 1]],
 	'bonder-speed' => [[1, 0], [-1, 1], [0, -1]],
+	'unbonder' => [[1, 0]],
+	'glyph-dispersion' => [[1, 0], [1, -1], [0, -1], [-1, 0]],
+	'glyph-disposal' => [[1, 0], [0, 1], [-1, 1], [-1, 0], [0, -1], [1, -1]],
+	'glyph-duplication' => [[1, 0]],
+	'glyph-projection' => [[1, 0]],
+	'glyph-purification' => [[1, 0], [0, 1]],
+	'glyph-unification' => [[0, 1], [-1, 1], [0, -1], [1, -1]],
+
 	'out-std' => [[1, 0]],
 );
 
@@ -564,28 +612,55 @@ sub merge_tracks($a, $b) {
 	$b->deleted = 1;
 }
 
-sub handle_overlap($a, $b, %map) {
+sub compute_trackmap($parts) {
+	my %point_to_track = ();
+	my %arm_to_track = ();
+	for my $part (reverse @$parts) {
+		$point_to_track{"@$_"} = $part for ($part->track // [])->@*;
+		$arm_to_track{$part} = $point_to_track{$part->xy} if $part->instructions;
+	}
+	return %arm_to_track;
+}
+
+sub track_eq($a, $b) {
+	return all { point_eq($$a[$_], $$b[$_]) } 0..max($#$a, $#$b);
+}
+
+sub handle_overlap($a, $b, $parts) {
 	return 1 if $a->deleted;
-	my ($a_name, $b_name) = ($a->name, $b->name);
-	my ($a_is_track, $a_is_arm) = ($a_name eq 'track', $a_name =~ /^(?:arm[1236]|piston)$/);
-	my ($b_is_track, $b_is_arm) = ($b_name eq 'track', $b_name =~ /^(?:arm[1236]|piston)$/);
+	my ($a_is_track, $a_is_arm) = ($a->name eq 'track', $a->name =~ /^(?:arm[1236]|piston)$/);
+	my ($b_is_track, $b_is_arm) = ($b->name eq 'track', $b->name =~ /^(?:arm[1236]|piston)$/);
 
 	if ($a_is_track && $b_is_track) {
 		return 1 if merge_tracks($a, $b);
-		my @arms_on_b = grep { $_->instructions } map { @$_ } @map{map { "@$_" } $b->track->@*};
-		$_->instructions =~ y/Aa/aA/ for @arms_on_b;
-		$b->track = [reverse $b->track->@*];
+		my %arm_to_track = compute_trackmap($parts);
+		my @arms_on_a = grep { ($arm_to_track{$_} // 0) == $a } @$parts;
+		$_->instructions =~ y/Aa/aA/ for @arms_on_a;
+		$a->track = [reverse $a->track->@*];
 		return merge_tracks($a, $b);
 	}
 
 	if ($a_is_arm && $b_is_arm) {
+		if ($a->instructions =~ /A/ && $b->instructions =~ /A/) {
+			my %arm_to_track = compute_trackmap($parts);
+			if (!track_eq($arm_to_track{$a}->track, $arm_to_track{$b}->track)) {
+				my $arm = index($a->instructions, 'G') > index($b->instructions, 'G') ? $a : $b;
+				my $track = $arm_to_track{$arm};
+				while (1) {
+					return 0 unless $arm->instructions =~ s/^\0*\K\0(.*)(.)$/$2$1/;
+					execute_instruction($arm, $2 =~ y/A-Za-z/a-zA-Z/r, $track->track, $track->loops);
+					last if $2 =~ /A/i;
+				}
+				return 1;
+			}
+		}
 		return if $a->size != $b->size;
 		return 0 if $a->instructions ne $b->instructions;
 		my $grippers = 1;
 		my $dr = $b->rotation - $a->rotation;
-		$grippers *= 2 if $a_name =~ /^arm[26]$/ or $b_name =~ /^arm[26]$/ or $dr % 2;
-		$grippers *= 3 if $a_name =~ /^arm[36]$/ or $b_name =~ /^arm[36]$/ or $dr % 3;
-		if ($a_name eq 'piston' or $b_name eq 'piston') {
+		$grippers *= 2 if $a->name =~ /^arm[26]$/ or $b->name =~ /^arm[26]$/ or $dr % 2;
+		$grippers *= 3 if $a->name =~ /^arm[36]$/ or $b->name =~ /^arm[36]$/ or $dr % 3;
+		if ($a->name eq 'piston' or $b->name eq 'piston') {
 			return if $grippers > 1;
 		} else {
 			$a->name = "arm$grippers";
@@ -594,7 +669,7 @@ sub handle_overlap($a, $b, %map) {
 	}
 
 	return 1 if ($a_is_track && $b_is_arm) || ($a_is_arm && $b_is_track);
-	return if $a_name ne $b_name;
+	return if $a->name ne $b->name;
 	return if $a->rotation != $b->rotation;
 	return if $a->x != $b->x || $a->y != $b->y;
 	# TODO bonder+bonder => bonder-speed?
@@ -608,13 +683,15 @@ sub deoverlap($parts) {
 		for my $point (part_points($part)) {
 			my $overlaps = ($map{"@$point"} //= []);
 			for (@$overlaps) {
-				my $result = handle_overlap($part, $_, %map);
+				my $result = handle_overlap($part, $_, $parts);
 				return $result if !$result;
 			}
 			push @$overlaps, $part;
 		}
 	}
+
 	@$parts = grep { !$_->deleted } @$parts;
+
 	return 1;
 }
 
@@ -627,8 +704,6 @@ sub try_merge($half_a, $half_b) {
 
 	my @result = ();
 	my @delayed = deep_copy(@$half_a);
-
-	# TODO GAga => gaGA and move arm to allow sharing track
 
 	for (1..3) {
 		$_->instructions =~ s/(?=\w)/\0/ for @delayed;
@@ -719,7 +794,7 @@ sub fold_tracked_arms($parts) {
 	for (@$parts) {
 		next unless $_->name eq 'track';
 		my %points = map { ("@$_" => 1) } $_->track->@*;
-		my @arms_on_track = grep { $points{"@$_[1, 2]"} } @arms;
+		my @arms_on_track = grep { $points{$_->xy} } @arms;
 		next if @arms_on_track != 1;
 		$arms_on_track[0]->track = $_->track;
 		$_->deleted = 1;
@@ -728,11 +803,11 @@ sub fold_tracked_arms($parts) {
 }
 
 sub unfold_tracked_arms($parts) {
-	for (@$parts) {
-		next unless $_->track && $_->name ne 'track';
-		push @$parts, Part::new('track', $_->x, $_->y, 1, 0, '', $_->track);
-		delete $$_[6];
-	}
+	@$parts = map {
+		$_->track && $_->name ne 'track' ?
+			($_, Part::new('track', $_->x, $_->y, 1, 0, '', delete $$_[6])) :
+			($_);
+	} @$parts;
 }
 
 sub angle($ax, $ay, $bx, $by) {
@@ -747,7 +822,7 @@ sub grab_point($x, $y, $size, $rotation) {
 	return $x + $size * $xfx, $y + $size * $yfx;
 }
 
-sub part_variants($part) {
+sub part_variants($part, $would_shorten_tape) {
 	my ($name, $x, $y, $size, $rotation, $instructions, $track, $loops) = @$part;
 
 	# Not an arm? Don’t do anything
@@ -759,7 +834,7 @@ sub part_variants($part) {
 	# Multi-arms can be converted to single arms, but nothing else
 	if ($name =~ /^arm([236])$/) {
 		return map {
-			Part::new('arm1', $x, $y, $size, $rotation + $_ * (6 / $1), $instructions =~ y/gO/X/rd);
+			Part::new('arm1', $x, $y, $size, $rotation + $_ * (6 / $1), $instructions =~ y/gO/X\0/r);
 		} 1..$1;
 	}
 
@@ -805,20 +880,25 @@ sub part_variants($part) {
 		}
 	}gie;
 
-	return arms_for_points($instructions, @points);
+	return arms_for_points($instructions, $require_loops, $would_shorten_tape, @points);
 }
 
-sub arms_for_points($instructions, @points) {
+sub arms_for_points($instructions, $require_loops, $would_shorten_tape, @points) {
 	my @result = ();
 	my ($grab_x, $grab_y) = $points[0]->@*;
+
+	my $add_arm = sub ($name, $size, $rotation, @args) {
+		$rotation %= 6;
+		my ($x, $y) = grab_point($grab_x, $grab_y, -$size, $rotation);
+		push @result, Part::new($name, $x, $y, $size, $rotation, @args);
+	};
 
 	# Pivots only)
 	if (@points == 1) {
 		die if $instructions =~ /[><]/;
 		for my $rotation (0..5) {
 			for my $size (1..3) {
-				my ($x, $y) = grab_point($grab_x, $grab_y, -$size, $rotation);
-				push @result, Part::new('arm1', $x, $y, $size, $rotation, $instructions);
+				$add_arm->('arm1', $size, $rotation, $instructions);
 			}
 		}
 		return @result;
@@ -827,56 +907,77 @@ sub arms_for_points($instructions, @points) {
 	my @dx = map { $points[$_][0] - $points[$_ - 1][0] } 1..$#points;
 	my @dy = map { $points[$_][1] - $points[$_ - 1][1] } 1..$#points;
 	my @angles = map { angle($dx[$_ - 1], $dy[$_ - 1], $dx[$_], $dy[$_]) } 1 .. $#dx;
-	my $angles = join '', map { $_ // '!' } @angles;
+	my $angles = join '', map { $_ // '?' } @angles;
 	my $size = max(map abs, @dx, @dy);
 
-	# Track
-	if ($size == 1) {
-		for my $rotation (0..5) {
-			my ($xfx, $yfx) = $xy_rotations[$rotation]->@*;
-			for my $size (1..3) {
-				my ($x, $y) = grab_point($grab_x, $grab_y, -$size, $rotation);
-				push @result, Part::new('arm1', $x, $y, $size, $rotation, $instructions =~ y/></Aa/r,
-					[map { [$$_[0] - $size * $xfx, $$_[1] - $size * $yfx] } @points]);
-			}
+	# Fixed arm
+	if ($angles =~ /^1*$|^5*$/) {
+		my $grippers = (@dx % 2 ? 2 : 1) * (@dx % 3 ? 3 : 1);
+		my @multi_instrs = ($instructions =~ s(g\K[^gG]*)($&=~y/></\0\0/r)erg);
+		push @multi_instrs, $multi_instrs[0] =~ s/\0$/O/r if $would_shorten_tape;
+		my $rotation = rotation_from_point(0 <=> $dx[0], 0 <=> $dy[0]);
+		if ($angles =~ /^1*$/) {
+			# Couter-clockwise
+			$add_arm->('arm1', $size, $rotation + 1, $instructions =~ y/></rR/r);
+			$add_arm->("arm$grippers", $size, $rotation + 1, $instructions =~ y/></rR/r) for @multi_instrs;
+		}
+		if ($angles =~ /^5*$/) {
+			# Clockwise
+			$add_arm->('arm1', $size, $rotation - 1, $instructions =~ y/></Rr/r);
+			$add_arm->("arm$grippers", $size, $rotation - 1, y/></Rr/r) for @multi_instrs;
 		}
 	}
+
+	# TODO handle some unusual bends
+
+	return @result if $size > 1;
+
+	# Tracked arm
+	for my $rotation (0..5) {
+		my ($xfx, $yfx) = $xy_rotations[$rotation]->@*;
+		for my $size (1..3) {
+			$add_arm->('arm1', $size, $rotation, $instructions =~ y/></Aa/r,
+			[map { [$$_[0] - $size * $xfx, $$_[1] - $size * $yfx] } @points]);
+		}
+	}
+
+	# TODO tracked arms with rotates/pistons
 
 	# Piston
+	my $rotation = rotation_from_point($dx[0], $dy[0]);
+
 	if ($angles =~ /^0?$/) {
-		my $rotation = rotation_from_point($dx[0], $dy[0]);
-		goto no_piston if !$rotation;
 		for my $size (1 .. 4 - @points) {
-			my ($x, $y) = grab_point($grab_x, $grab_y, -$size, $rotation);
-			push @result, Part::new('piston', $x, $y, $size, $rotation, $instructions =~ y/></Ee/r);
+			$add_arm->('piston', $size, $rotation, $instructions =~ y/></Ee/r);
 		}
-		$rotation = ($rotation + 3) % 6;
 		for my $size (@points .. 3) {
-			my ($x, $y) = grab_point($grab_x, $grab_y, -$size, $rotation);
-			push @result, Part::new('piston', $x, $y, $size, $rotation, $instructions =~ y/></eE/r);
+			$add_arm->('piston', $size, $rotation + 3, $instructions =~ y/></eE/r);
 		}
 	}
-	no_piston:
 
-	# CW arm
-	if ($angles =~ /^5*$/) {
-		my $grippers = (@dx % 2 ? 2 : 1) * (@dx % 3 ? 3 : 1);
-		my $rotation = (rotation_from_point(0 <=> $dx[0], 0 <=> $dy[0]) - 1) % 6;
-		my ($x, $y) = grab_point($grab_x, $grab_y, -$size, $rotation);
-		push @result, Part::new('arm1', $x, $y, $size, $rotation, $instructions =~ y/></Rr/r);
-		push @result, Part::new("arm$grippers", $x, $y, $size, $rotation, $instructions =~ y/></Rr/r);
-	}
+	# Bent pistons
+	my $bent_instrs = sub ($lo, $hi, $limit) {
+		my $state = 0;
+		if ($limit < 0 or (@dx - $limit) < 0) {
+			say $limit, " ", 0+@dx;
+		}
+		my @plus = (($lo) x $limit, ($hi) x (@dx - $limit));
+		my @minus = map { y/A-Za-z/a-zA-Z/r } @plus;
+		my $result = $instructions =~ s{[><]}{
+			$& eq '>' ? $plus[$state++] : $minus[--$state];
+		}gre;
+		return $result;
+	};
+	my $n = 0 + @angles;
 
-	# CCW arm
-	if ($angles =~ /^1*$/) {
-		my $grippers = (@dx % 2 ? 2 : 1) * (@dx % 3 ? 3 : 1);
-		my $rotation = (rotation_from_point(0 <=> $dx[0], 0 <=> $dy[0]) + 1) % 6;
-		my ($x, $y) = grab_point($grab_x, $grab_y, -$size, $rotation);
-		push @result, Part::new('arm1', $x, $y, $size, $rotation, $instructions =~ y/></rR/r);
-		push @result, Part::new("arm$grippers", $x, $y, $size, $rotation, $instructions =~ y/></rR/r);
-	}
-
-	# TODO 2-rotate arm => RE/eR piston or bent 3-track
+	$add_arm->('piston', 2, $rotation + 3, $bent_instrs->('e', 'R', 1))         if $angles =~ /^15*$/;
+	$add_arm->('piston', 2, $rotation + 3, $bent_instrs->('e', 'r', 1))         if $angles =~ /^51*$/;
+	$add_arm->('piston', 1, $rotation - 2, $bent_instrs->('r', 'E', @angles+0)) if $angles =~ /^1*5$/;
+	$add_arm->('piston', 1, $rotation + 2, $bent_instrs->('R', 'E', @angles+0)) if $angles =~ /^5*1$/;
+	$add_arm->('piston', 3, $rotation + 3, $bent_instrs->('e', 'R', 2))         if $angles =~ /^015*$/;
+	$add_arm->('piston', 3, $rotation + 3, $bent_instrs->('e', 'r', 2))         if $angles =~ /^051*$/;
+	$add_arm->('piston', 1, $rotation - 2, $bent_instrs->('r', 'E', @angles-1)) if $angles =~ /^1*50$/;
+	$add_arm->('piston', 1, $rotation + 2, $bent_instrs->('R', 'E', @angles-1)) if $angles =~ /^5*10$/;
 
 	return @result;
 }
@@ -885,15 +986,16 @@ sub variantify(@parts) {
 	@parts = deep_copy(@parts);
 	normalize(\@parts);
 	fold_tracked_arms(\@parts);
+
+	my @tape_lengths = map { $_->instructions =~ /\w.*/ ? $+[0] - $-[0] : 0 } @parts;
+	my $tape_length = max @tape_lengths;
+	my @longest_tape_indices = grep { $tape_lengths[$_] == $tape_length } 0..$#tape_lengths;
+	my $unique_longest_tape_index = @longest_tape_indices == 1 ? $longest_tape_indices[0] : -1;
+
 	my @variants = ();
 
-	# TODO
-	sub would_shorten_tape_l(@parts) {
-		return max map { $_->instructions =~ /\w.*/ ? $+[0] - $-[0] : 0 } @parts;
-	}
-
 	for my $i (0..$#parts) {
-		for my $part_variant (part_variants($parts[$i])) {
+		for my $part_variant (part_variants($parts[$i], $i == $unique_longest_tape_index)) {
 			my @variant = deep_copy(@parts);
 			$variant[$i] = $part_variant;
 			unfold_tracked_arms(\@variant);
@@ -913,7 +1015,6 @@ if ($h) {
 	say "-u: update solution list";
 	say "-n: name solutions";
 	say "-g: generate halves";
-	say "-m: merge halves";
 	say "-v: variantify";
 	exit;
 }
@@ -954,6 +1055,7 @@ if ($g) {
 	my %old_md5 = map { /\/(.*?)\./; $1 => 1 } <normalized/*.solution>;
 	my %new_md5 = ();
 
+	# for my $file (<test.solution>) {
 	for my $file (<{solution,extra_solutions}/*.solution>) {
 		my @parts = solution_to_parts(slurp($file, 1));
 		my $goal = omsim(\@parts);
@@ -966,6 +1068,7 @@ if ($g) {
 		if (@inputs == 1) {
 			die if @halves != 1;
 			my $attempt = omsim($halves[0]);
+			write_file("test/half.solution", parts_to_solution(@{$halves[0]}), 1);
 			die "$attempt ne $goal" if $attempt ne $goal;
 		}
 		elsif (@halves == 2) {
@@ -1012,14 +1115,11 @@ if ($v) {
 	for my $file (<{solution,extra_solutions}/*.solution>) {
 		my @parts = solution_to_parts(slurp($file, 1));
 		my $pretty = omsim(\@parts);
-		write_file("test/broken.solution", parts_to_solution(@parts), 1) if !$pretty;
-		die "normalizing broke solve $file" if !$pretty;
 		push @parts, $pretty;
 		postprocess(\@parts);
 	}
 
 	warn "merging...";
-
 	for (0..$#halves) {
 		my $a = $halves[$_];
 		postprocess($_) for map { try_all_merges($a, $_) } @halves[$_..$#halves];
@@ -1028,23 +1128,16 @@ if ($v) {
 	}
 
 	warn "variantifying...";
-
 	my $count = 0;
-
-	while (1) {
-		my $parts = shift((first { @$_ } @q)->@*);
-		last if !$parts;
+	while (my $entry = first { @$_ } @q) {
+		my $parts = shift @$entry;
 		++$count;
-		if (!($count & ($count - 1))) {
-			say "$count: ", join ', ', map { 0+@$_ } @q;
-		}
-		for my $variant (variantify(@$parts)) {
-			postprocess($variant);
-		}
+		say "$count: ", join ', ', map { 0+@$_ } @q if !($count & ($count - 1));
+		postprocess($_) for variantify(@$parts);
 	}
 }
 
-if (1) {
+if (0) {
 	$puzzle = 'c400776884268947';
 	$part_points{'out-std'} = undef;
 
@@ -1061,7 +1154,7 @@ if (1) {
 		my $pretty = omsim($solve);
 		my @variants = variantify(@$solve);
 		my $arm_counts = count_arms(@variants);
-		say "$name: $pretty $arm_counts";
+		printf "%-16s %-36s %s\n", $name, $pretty, $arm_counts;
 		for my $variant (@variants) {
 			pop @$variant;
 			my $variant_arm_counts = count_arms(variantify(@$variant));
@@ -1071,24 +1164,91 @@ if (1) {
 		}
 	}
 
-	test_variants('length 1', [
+	for my $size (1..3) {
+		test_variants("size $size simple", [
+			Part::new('out-std', 0, 0, 1, 0, ''),
+			Part::new('input', $size, 0, 1, 0, ''),
+			Part::new('arm1', 0, $size, $size, 5, 'GRgr'),
+		]);
+
+		test_variants("size $size double", [
+			Part::new('out-std', 0, 0, 1, 0, ''),
+			Part::new('input', $size, $size, 1, 0, ''),
+			Part::new('arm1', 0, $size, $size, 0, 'GRRgrr'),
+		]);
+
+		test_variants("size $size triple", [
+			Part::new('out-std', 0, 0, 1, 0, ''),
+			Part::new('input', 0, 2*$size, 1, 0, ''),
+			Part::new('arm1', 0, $size, $size, 1, 'GRRRgrrr'),
+		]);
+
+		test_variants("size $size quad", [
+			Part::new('out-std', 0, 0, 1, 0, ''),
+			Part::new('input', -$size, 2*$size, 1, 0, ''),
+			Part::new('arm1', 0, $size, $size, 2, 'GRRRRgRR'),
+		]);
+
+		test_variants("size $size quint", [
+			Part::new('out-std', 0, 0, 1, 0, ''),
+			Part::new('input', -$size, $size, 1, 0, ''),
+			Part::new('arm1', 0, $size, $size, 3, 'GRRRRRgR'),
+		]);
+	}
+
+	test_variants("pivot only", [
+		Part::new('out-std', 0, 0, 1, 0, ''),
+		Part::new('input', 0, 0, 1, 0, ''),
+		Part::new('arm1', 1, 0, 1, 3, 'GPg'),
+	]);
+
+	test_variants("3 straight", [
+		Part::new('out-std', 0, 0, 1, 0, ''),
+		Part::new('input', 2, 0, 1, 0, ''),
+		Part::new('piston', 3, 0, 1, 3, 'GEEgee'),
+	]);
+
+	test_variants("triangle", [
 		Part::new('out-std', 0, 0, 1, 0, ''),
 		Part::new('input', 1, 0, 1, 0, ''),
-		Part::new('arm1', 0, 1, 1, 5, 'GRgr'),
+		Part::new('track', -1, 0, 1, 0, '', [[-1, 0], [-2, 1], [-2, 0]], 1),
+		Part::new('arm1', -1, 0, 2, 0, 'GAAgA'),
 	]);
 
-	test_variants('length 2', [
+	test_variants("bent 1", [
 		Part::new('out-std', 0, 0, 1, 0, ''),
-		Part::new('input', 2, 0, 1, 0, ''),
-		Part::new('arm1', 0, 2, 2, 5, 'GRgr'),
+		Part::new('input', 2, 1, 1, 0, ''),
+		Part::new('track', 1, 2, 1, 0, '', [[1, 2], [1, 1], [0, 1], [-1, 1]]),
+		Part::new('arm1', 1, 2, 1, 5, 'GAAAgaaa'),
 	]);
 
-	test_variants('length 3', [
+	test_variants("bent 2", [
 		Part::new('out-std', 0, 0, 1, 0, ''),
-		Part::new('input', 2, 0, 1, 0, ''),
-		Part::new('arm1', 0, 2, 2, 5, 'GRgr'),
+		Part::new('input', 2, 1, 1, 0, ''),
+		Part::new('track', 1, 2, 1, 0, '', [[1, 2], [0, 2], [0, 1], [-1, 1]]),
+		Part::new('arm1', 1, 2, 1, 5, 'GAAAgaaa'),
 	]);
 
+	test_variants("bent 3", [
+		Part::new('out-std', 0, 0, 1, 0, ''),
+		Part::new('input', 2, 1, 1, 0, ''),
+		Part::new('track', 1, 2, 1, 0, '', [[1, 2], [0, 2], [-1, 2], [-1, 1]]),
+		Part::new('arm1', 1, 2, 1, 5, 'GAAAgaaa'),
+	]);
+
+	test_variants("bent 4", [
+		Part::new('out-std', 0, 0, 1, 0, ''),
+		Part::new('input', 3, 1, 1, 0, ''),
+		Part::new('track', 2, 2, 1, 0, '', [[2, 2], [1, 2], [1, 1], [0, 1], [-1, 1]]),
+		Part::new('arm1', 2, 2, 1, 5, 'GAAAAgaaaa'),
+	]);
+
+	test_variants("bent 5", [
+		Part::new('out-std', 0, 0, 1, 0, ''),
+		Part::new('input', 3, 1, 1, 0, ''),
+		Part::new('track', 2, 2, 1, 0, '', [[2, 2], [1, 2], [0, 2], [0, 1], [-1, 1]]),
+		Part::new('arm1', 2, 2, 1, 5, 'GAAAAgaaaa'),
+	]);
 }
 
 if (0) {
