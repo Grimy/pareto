@@ -26,7 +26,8 @@ package Part {
 	sub track :lvalue ($self)        { $$self[6] }
 	sub loops :lvalue ($self)        { $$self[7] }
 	sub deleted :lvalue ($self)      { $$self[8] }
-	sub xy ($self)                   { "@$self[1, 2]" }
+	sub xy($self)                    { "@$self[1, 2]" }
+	sub delay($self)                 { $$self[5] =~ /\w/ ? $-[0] : 0 }
 	sub pretty($self) {
 		my $result = "$$self[0] @[$$self[1], $$self[2]] size=$$self[3] rotation=$$self[4]";
 		$result .= ' instructions=' . $$self[5] =~ y/\0/./r if $$self[5];
@@ -369,7 +370,7 @@ sub expand_instructions(@parts) {
 }
 
 sub tape_length(@parts) {
-	return max map { $_->instructions =~ /\w.*/ ? $+[0] - $-[0] : 0 } @parts;
+	return max map { $_->instructions =~ /\w.*/ ? length($&) : 0 } @parts;
 }
 
 sub execute_instruction($arm, $i, $track, $loops) {
@@ -386,10 +387,11 @@ sub execute_instruction($arm, $i, $track, $loops) {
 }
 
 sub normalize($parts) {
+	@$parts = grep { $_->name ne 'glyph-marker' } @$parts;
 	expand_instructions(@$parts);
 	my $tape_length = tape_length(@$parts);
-	@$parts = grep { $_->name ne 'glyph-marker' } @$parts;
 	my @arms = grep { $_->instructions =~ /\w/ } @$parts;
+	map { $_->instructions =~ s/O/\0/g; $_->instructions =~ s/\0+$// } @arms;
 
 	for (5, 4, 3, 2) {
 		next if $tape_length % $_;
@@ -401,8 +403,6 @@ sub normalize($parts) {
 		$_->instructions =~ s/^\0*+.{$period}\K.*// for @arms;
 		$tape_length = $period;
 	}
-
-	map { $_->instructions =~ s/O/\0/g; $_->instructions =~ s/\0+$// } @arms;
 
 	my ($out) = grep { $_->name eq 'out-std' } @$parts;
 	translate_parts($parts, -$out->x, -$out->y);
@@ -419,8 +419,7 @@ sub normalize($parts) {
 	my $new_tape_length = tape_length(@arms);
 	if ($new_tape_length != $tape_length) {
 		my $arm = first { $_->instructions =~ /\w/ } @$parts;
-		$arm->instructions =~ /\w/;
-		vec($arm->instructions, $-[0] + $tape_length - 1, 8) ||= ord 'O';
+		vec($arm->instructions, $arm->delay + $tape_length - 1, 8) ||= ord 'O';
 	}
 
 	my $first = first { $_->instructions && $_->y } @$parts;
@@ -468,7 +467,7 @@ sub normalize($parts) {
 		}
 	}
 
-	my $start_delay = min map { $_->instructions =~ /\w/; $-[0] } @arms;
+	my $start_delay = min map { $_->delay } @arms;
 	$_->instructions = substr($_->instructions, $start_delay) for @arms;
 }
 
@@ -498,18 +497,10 @@ sub minify($parts, $cycles) {
 	my $old_name = $_->name;
 	return if $old_name =~ /^(?:input|out-std|glyph-marker)$/;
 
-	my $old_instrs = $_->instructions;
 	$_->name = 'glyph-marker';
-	$_->instructions = '';
-
 	return 1 if is_not_slower($parts, $cycles);
 
-	$_->instructions = $old_instrs;
-	return 1 if $old_instrs =~ /\w/ and is_not_slower($parts, $cycles);
-
-	# TODO minify loop length
-
-	if ($old_name =~ /^arm([236])$/ and $old_instrs !~ /R/i) {
+	if ($old_name =~ /^arm([236])$/ and $_->instructions !~ /R/i) {
 		$_->name = 'arm1';
 		for my $unused (1..$1) {
 			$_->rotation += 6 / $1;
@@ -526,7 +517,6 @@ sub minify($parts, $cycles) {
 	}
 
 	$_->name = $old_name;
-
 	if ($_->track and $_->track->@* > 2) {
 		my $track = $_->track;
 		my $segment = pop @$track;
@@ -538,6 +528,17 @@ sub minify($parts, $cycles) {
 	}
 
 	return 0;
+}
+
+sub minimize_loop_length($parts) {
+	my @arms = grep { $_->instructions =~ /\w/ } @$parts;
+	while (all { $_->instructions =~ /O$/ || $_->name eq 'glyph-marker' } @arms) {
+		chop $_->instructions for @arms;
+		if (!omsim($parts)) {
+			$_->instructions .= 'O' for @arms;
+			return;
+		}
+	}
 }
 
 sub halvify(@parts) {
@@ -552,7 +553,13 @@ sub halvify(@parts) {
 		if ($score =~ /\d+(?=c)/) {
 			my $cycles = $&;
 			expand_instructions(@$copy);
+			my $tape_length = tape_length(@$copy);
+			for (@$copy) {
+				next unless $_->instructions =~ /\w/;
+				$_->instructions .= 'O' x ($-[0] + $tape_length - length($_->instructions));
+			}
 			1 while any { minify($copy, $cycles) } @$copy;
+			minimize_loop_length($copy);
 			push @halves, $copy;
 		}
 	}
@@ -1017,7 +1024,7 @@ sub variantify(@parts) {
 	normalize(\@parts);
 	fold_tracked_arms(\@parts);
 
-	my @tape_lengths = map { $_->instructions =~ /\w.*/ ? $+[0] - $-[0] : 0 } @parts;
+	my @tape_lengths = map { $_->instructions =~ /\w.*/ ? length($&) : 0 } @parts;
 	my $tape_length = max @tape_lengths;
 	my @longest_tape_indices = grep { $tape_lengths[$_] == $tape_length } 0..$#tape_lengths;
 	my $unique_longest_tape_index = @longest_tape_indices == 1 ? $longest_tape_indices[0] : -1;
@@ -1101,12 +1108,22 @@ if ($g) {
 			die "$attempt ne $goal" if $attempt ne $goal;
 		}
 		elsif (@halves == 2) {
-			my @attempts = try_all_merges($halves[0], $halves[1]);
+			my @attempts = try_all_merges(@halves);
 			mirror_parts($halves[0]);
-			push @attempts, try_all_merges($halves[0], $halves[1]);
-			mirror_parts($halves[0]);
-			@attempts = map { $_->[-1] } @attempts;
-			die join "\n", $goal, @attempts if !any { $_ eq $goal } @attempts;
+			push @attempts, try_all_merges(@halves);
+			next if any { $_->[-1] eq $goal } @attempts;
+			my @tape_lengths = map { tape_length(@$_) } @halves;
+			if ($tape_lengths[0] > $tape_lengths[1]) {
+				@tape_lengths = reverse @tape_lengths;
+				@halves = reverse @halves;
+			}
+			if ("@tape_lengths" =~ /^4 12$|^13 13$/) {
+				my $arm = first { $_->instructions =~ /\w/ } $halves[1]->@*;
+				vec($arm->instructions, $arm->delay + $tape_lengths[1], 8) = ord 'O';
+				push @attempts, try_all_merges(@halves);
+			}
+			next if any { $_->[-1] eq $goal } @attempts;
+			die join "\n", $goal, map { $_->[-1] } @attempts;
 		}
 	}
 
