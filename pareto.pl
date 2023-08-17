@@ -3,6 +3,7 @@
 use utf8;
 use v5.36;
 use warnings;
+use Carp;
 use Data::Dumper;
 use Digest::MD5 qw(md5_base64);
 use IPC::Open3;
@@ -12,8 +13,6 @@ use Memoize;
 
 
 our ($h, $u, $n, $g, $v);
-
-# TODO automate removing instructions past C score
 
 package Part {
 	sub new(@args) { return bless [@args], "Part" }
@@ -262,6 +261,17 @@ my @xy_rotations = (
 	[ 1, -1,  1,  0],
 );
 
+my %rotational_symmetry = (
+	'arm2' => 3,
+	'arm3' => 2,
+	'arm6' => 1,
+	'bonder-speed' => 2,
+	'glyph-calcification' => 1,
+	'glyph-dispersion' => 3,
+	'glyph-disposal' => 1,
+	'input' => 1,
+);
+
 sub rotate_parts($parts, $rotation) {
 	my ($xfx, $yfx, $xfy, $yfy) = $xy_rotations[$rotation]->@*;
 	for my $part (@$parts) {
@@ -276,6 +286,15 @@ sub rotation_from_point($dx, $dy) {
 	return first { point_eq($xy_rotations[$_], [$dx, $dy]) } 0..5;
 }
 
+sub modulize_rotation($part) {
+	$part->rotation %= ($rotational_symmetry{$part->name} // 6);
+	if (($part->name =~ /^(?:un)?bonder$/) && $part->rotation >= 3) {
+		$part->x += $xy_rotations[$part->rotation][0];
+		$part->y += $xy_rotations[$part->rotation][1];
+		$part->rotation %= 3;
+	}
+}
+
 sub mirror_parts($parts) {
 	for my $part (@$parts) {
 		$part->x += $part->y;
@@ -285,15 +304,6 @@ sub mirror_parts($parts) {
 		$_->[0] += $_->[1], $_->[1] *= -1 for ($part->track // [])->@*;
 	}
 }
-
-my %rotational_symmetry = (
-	input => 1,
-	"glyph-calcification" => 1,
-	"bonder-speed" => 2,
-	arm2 => 3,
-	arm3 => 2,
-	arm6 => 1,
-);
 
 # P = pivot right
 # E = extend
@@ -386,13 +396,82 @@ sub execute_instruction($arm, $i, $track, $loops) {
 	}
 }
 
+sub should_mirror(@parts) {
+	my %sums = ();
+	for (@parts) {
+		my $y = $_->y;
+		$y += $xy_rotations[$_->rotation][1] / 2 if $_->name =~ /^(?:un)?bonder$/;
+		$sums{all} += $y;
+		$sums{$_->name} += $y;
+	}
+	for (sort keys %sums) {
+		return 1 if $sums{$_} < 0;
+		return 0 if $sums{$_} > 0;
+	}
+
+	my @a = deep_copy(@parts);
+	modulize_rotation($_) for @a;
+	@a = sort { $b->instructions cmp $a->instructions || $a->x <=> $b->x || $a->y <=> $b->y } @a;
+	my @b = deep_copy(@a);
+	mirror_parts(\@b);
+	my $md5_a = md5_base64(parts_to_solution(@parts));
+	my $md5_b = md5_base64(parts_to_solution(@parts));
+	return $md5_a gt $md5_b;
+}
+
 sub normalize($parts) {
+	# Remove equilibrium
 	@$parts = grep { $_->name ne 'glyph-marker' } @$parts;
+
+	# Expand instructions
+	my @arms = grep { $_->instructions } @$parts;
 	expand_instructions(@$parts);
 	my $tape_length = tape_length(@$parts);
-	my @arms = grep { $_->instructions =~ /\w/ } @$parts;
-	map { $_->instructions =~ s/O/\0/g; $_->instructions =~ s/\0+$// } @arms;
 
+	# Translate, rotate
+	my ($out) = grep { $_->name eq 'out-std' } @$parts;
+	translate_parts($parts, -$out->x, -$out->y);
+	rotate_parts($parts, -$out->rotation);
+
+	# Track stuff
+	for my $part (grep { $_->track } @$parts) {
+		my $track = $part->track;
+		my ($xfx, $yfx, $xfy, $yfy) = $xy_rotations[$part->rotation]->@*;
+		map {
+			my ($x, $y) = @$_;
+			$_->[0] = $x * $xfx + $y * $xfy;
+			$_->[1] = $x * $yfx + $y * $yfy;
+		} @$track;
+
+		my %points = map { ("@$_" => 1) } @$track;
+		my @arms_on_track = grep { $points{$_->xy} } @arms;
+
+		if (@arms_on_track == 1) {
+			my $arm = $arms_on_track[0];
+			while ($arm->instructions =~ s/^\0*+\K[^G]/\0/) {
+				vec($arm->instructions, $-[0] + $tape_length, 8) = ord $&;
+				execute_instruction($arm, $&, $track, $part->loops);
+			}
+		}
+
+		if (0 < sum map { $_->instructions =~ /A/i ? (ord($&) - 81) * 2**-$-[0] : 0 } @arms_on_track) {
+			$_->instructions =~ y/Aa/aA/ for @arms_on_track;
+			@$track = reverse @$track;
+		}
+
+		# if ($_->loop)
+		# TODO normalize loop start point
+		# TODO unmerge unnecessarily merged tracks
+		@$part[1, 2] = $track->[0]->@*;
+		$part->rotation = 0;
+	}
+
+	# Remove noops and start delay
+	map { $_->instructions =~ s/O/\0/g; $_->instructions =~ s/\0+$// } @arms;
+	my $start_delay = min map { $_->delay } @arms;
+	$_->instructions = substr($_->instructions, $start_delay) for @arms;
+
+	# Divide period
 	for (5, 4, 3, 2) {
 		next if $tape_length % $_;
 		my $period = $tape_length / $_;
@@ -404,71 +483,20 @@ sub normalize($parts) {
 		$tape_length = $period;
 	}
 
-	my ($out) = grep { $_->name eq 'out-std' } @$parts;
-	translate_parts($parts, -$out->x, -$out->y);
-	rotate_parts($parts, -$out->rotation);
+	# Mirror if needed
+	mirror_parts($parts) if should_mirror(@$parts);
 
-	@$parts = sort {
-		$a->name cmp $b->name ||
-		($a->x + $a->y / 2) <=> ($b->x + $b->y / 2) ||
-		abs($a->y) <=> abs($b->y) ||
-		uc($a->instructions) cmp uc($b->instructions) ||
-		$a->y <=> $b->y
-	} @$parts;
+	# Modulize rotation
+	modulize_rotation($_) for @$parts;
 
-	my $new_tape_length = tape_length(@arms);
-	if ($new_tape_length != $tape_length) {
-		my $arm = first { $_->instructions =~ /\w/ } @$parts;
-		vec($arm->instructions, $arm->delay + $tape_length - 1, 8) ||= ord 'O';
+	# Sort
+	@$parts = sort { $b->instructions cmp $a->instructions || $a->x <=> $b->x || $a->y <=> $b->y } @$parts;
+
+	# Add single noop if needed
+	if (tape_length(@arms) != $tape_length) {
+		my $arm = first { $_->instructions =~ /^\w/ } @$parts;
+		vec($arm->instructions, $tape_length - 1, 8) ||= ord 'O';
 	}
-
-	my $first = first { $_->instructions && $_->y } @$parts;
-	mirror_parts($parts) if $first and $first->y < 0;
-
-	for my $part (@$parts) {
-		my $name = $part->name;
-		$part->rotation %= ($rotational_symmetry{$name} // 6);
-		if (($name =~ /^(?:un)?bonder$/) && $part->rotation >= 3) {
-			$part->x += $xy_rotations[$part->rotation][0];
-			$part->y += $xy_rotations[$part->rotation][1];
-			$part->rotation %= 3;
-		}
-
-		if ($name eq 'track') {
-			my $track = $part->track;
-			my ($xfx, $yfx, $xfy, $yfy) = $xy_rotations[$part->rotation]->@*;
-			map {
-				my ($x, $y) = @$_;
-				$_->[0] = $x * $xfx + $y * $xfy;
-				$_->[1] = $x * $yfx + $y * $yfy;
-			} @$track;
-
-			my %points = map { ("@$_" => 1) } @$track;
-			my @arms_on_track = grep { $points{$_->xy} } @arms;
-
-			if (@arms_on_track == 1) {
-				my $arm = $arms_on_track[0];
-				while ($arm->instructions =~ s/^\0*+\K[^G]/\0/) {
-					vec($arm->instructions, $-[0] + $tape_length, 8) = ord $&;
-					execute_instruction($arm, $&, $part->track, $part->loops);
-				}
-			}
-
-			if (0 < sum map { $_->instructions =~ /A/i ? (ord($&) - 81) * 2**-$-[0] : 0 } @arms_on_track) {
-				$_->instructions =~ y/Aa/aA/ for @arms_on_track;
-				@$track = reverse @$track;
-			}
-
-			# if ($_->loop)
-			# TODO normalize loop start point
-			# TODO unmerge unnecessarily merged tracks
-			@$part[1, 2] = $track->[0]->@*;
-			$part->rotation = 0;
-		}
-	}
-
-	my $start_delay = min map { $_->delay } @arms;
-	$_->instructions = substr($_->instructions, $start_delay) for @arms;
 }
 
 sub deep_copy(@parts) {
@@ -638,7 +666,7 @@ sub compute_trackmap($parts) {
 }
 
 sub track_eq($a, $b) {
-	return all { point_eq($$a[$_], $$b[$_]) } 0..max($#$a, $#$b);
+	return all { point_eq($$a[$_], $$b[$_]) } 0..min($#$a, $#$b);
 }
 
 sub handle_tribonder_overlap($bonder, $tribonder) {
@@ -798,20 +826,8 @@ sub try_all_merges($a, $b) {
 }
 
 sub save_and_check(@parts) {
-	state %known_bad = (
-		'swonL_bs9JyzdqmZ6LT1Og' => 1,
-		'MTHnuDB0qz+Dm2jhwLLHSw' => 1,
-		'xfsOsRqLJJm2o9GEs3n9Tw' => 1,
-		'zRtfu018k0GbCIZWTJfr8A' => 1,
-		'IO7QuaSCgK86oEPERq8OUw' => 1,
-		'_O43gzbhzFbJ7rz5FOfhlw' => 1,
-		'oMk26zID1ZlpiREE77cjGw' => 1,
-		'43Skz9vB_DO7DsGAgTJ0wA' => 1,
-	);
-
 	my $solution = parts_to_solution(@parts);
 	my $md5 = md5_base64($solution) =~ y(/)(_)r;
-	say $md5, return if $known_bad{$md5};
 	return $md5 if -f "normalized/$md5.solution";
 	write_file("normalized/$md5.solution", $solution, 1);
 
@@ -1081,11 +1097,6 @@ if ($n) {
 	for (sort { $$a{lastModified} cmp $$b{lastModified} } grep { $$_{lastModified} } @solves) {
 		say "$$_{fullFormattedScore}: @{$$_{names}}";
 	}
-}
-
-for my $file (<normalized/*.solution>) {
-	# for my $file (<{solution,extra_solutions}/*.solution>) {
-	my @parts = solution_to_parts(slurp($file, 1));
 }
 
 if ($g) {
