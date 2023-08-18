@@ -908,7 +908,7 @@ sub grab_point($x, $y, $size, $rotation) {
 }
 
 sub part_variants($part, $would_shorten_tape) {
-	my ($name, $x, $y, $size, $rotation, $instructions, $track, $loops) = @$part;
+	my ($instructions, $track) = ($part->instructions, $part->track);
 
 	# Not an arm? Don’t do anything
 	return if $instructions !~ /\w/;
@@ -917,37 +917,37 @@ sub part_variants($part, $would_shorten_tape) {
 	return if $instructions =~ /A/i && !$track;
 
 	# Multi-arms can be converted to single arms, but nothing else
-	if ($name =~ /^arm([236])$/) {
+	if ($part->name =~ /^arm([236])$/) {
 		return map {
-			Part::new('arm1', $x, $y, $size, $rotation + $_ * (6 / $1), $instructions =~ y/gO/X\0/r);
+			Part::new('arm1', $part->x, $part->y, $part->size,
+				$part->rotation + $_ * (6 / $1), $instructions =~ y/gO/X\0/r);
 		} 1..$1;
 	}
 
-	my @points = ([grab_point($x, $y, $size, $rotation)]);
+	my ($grab_x, $grab_y) = grab_point($part->x, $part->y, $part->size, $part->rotation);
+	my @points = ([$grab_x, $grab_y]);
 	my $index = 0;
-	my $track_pos = $track ? first { point_eq($$track[$_], [$x, $y]) } 0..$#$track : 0;
 	my $require_loops = 0;
+	my $grab_index = 0;
+	my $loops = $part->loops;
 
 	$instructions =~ s{[ERA]}{
-		my ($i, $pos) = ($&, $-[0]);
-		$size = min(3, $size + 1) if $& eq 'E';
-		$size = max(1, $size - 1) if $& eq 'e';
-		$rotation = ($rotation - 1) % 6 if $& eq 'R';
-		$rotation = ($rotation + 1) % 6 if $& eq 'r';
-		if ($& =~ /A/i) {
-			$track_pos += $& eq 'A' ? 1 : -1;
-			$track_pos = $loops ? $track_pos % @$track : max(0, min($#$track, $track_pos));
-			($x, $y) = $track->[$track_pos]->@*;
-		}
-		my $point = [grab_point($x, $y, $size, $rotation)];
+		execute_instruction($part, $&, $track, $loops);
+		my $point = [grab_point($part->x, $part->y, $part->size, $part->rotation)];
 		my $last_index = $index;
 		$index = first { point_eq($points[$_], $point) } 0..$#points;
 		if (!defined($index)) {
-			# TODO also handle $last_index == 0, unshifting into @points
-			return if $last_index != $#points;
-			push @points, $point;
-			$index = $#points;
-			'>'
+			if ($last_index == $#points) {
+				push @points, $point;
+				$index = $#points;
+				'>'
+			} elsif ($last_index == 0) {
+				unshift @points, $point;
+				$index = 0;
+				'<'
+			} else {
+				return;
+			}
 		} elsif ($index == $last_index + 1) {
 			'>'
 		} elsif ($index == $last_index - 1) {
@@ -965,12 +965,7 @@ sub part_variants($part, $would_shorten_tape) {
 		}
 	}gie;
 
-	return arms_for_points($instructions, $require_loops, $would_shorten_tape, @points);
-}
-
-sub arms_for_points($instructions, $require_loops, $would_shorten_tape, @points) {
 	my @result = ();
-	my ($grab_x, $grab_y) = $points[0]->@*;
 
 	my $add_arm = sub ($name, $size, $rotation, @args) {
 		$rotation %= 6;
@@ -1249,7 +1244,7 @@ for my $file (<solution/*.solution>) {
 	}
 }
 
-if (0) {
+if (1) {
 	$puzzle = 'c400776884268947';
 	$part_points{'out-std'} = undef;
 
