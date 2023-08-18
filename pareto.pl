@@ -23,8 +23,17 @@ package Part {
 	sub rotation :lvalue ($self)     { $$self[4] }
 	sub instructions :lvalue ($self) { $$self[5] }
 	sub track :lvalue ($self)        { $$self[6] }
-	sub loops :lvalue ($self)        { $$self[7] }
-	sub deleted :lvalue ($self)      { $$self[8] }
+	sub deleted :lvalue ($self)      { $$self[7] }
+
+	sub loops($self) {
+		return if !$self->track;
+		my $track = $self->track;
+		return if @$track <= 2;
+		my $dx = $$track[-1][0] - $$track[0][0];
+		my $dy = $$track[-1][1] - $$track[0][1];
+		return abs($dx) <= 1 && abs($dy) <= 1 && abs($dx + $dy) <= 1;
+	}
+
 	sub xy($self)                    { "@$self[1, 2]" }
 	sub delay($self)                 { $$self[5] =~ /\w/ ? $-[0] : 0 }
 	sub pretty($self) {
@@ -185,7 +194,6 @@ sub nplet_to_filename {
 sub solution_to_parts($sol) {
 	(my ($magic, $level, $sol_name, $part_count), $sol) = unpack 'LC/aC/aL/(x8)La*', $sol;
 	die "$magic != 7" if $magic != 7;
-	# die "$level ne 'P007'" if $level ne 'P007';
 	return map {
 		(my ($part_name, $magic, $x, $y, $size, $rotation, $ionum, $instr_count), $sol) = unpack 'C/aCllLlLLa*', $sol;
 		die "$magic != 1" if $magic != 1;
@@ -209,10 +217,6 @@ sub solution_to_parts($sol) {
 			}
 			($result->x, $result->y) = $track[0]->@*;
 			$result->track = \@track;
-
-			my $dx = $track[-1][0] - $track[0][0];
-			my $dy = $track[-1][1] - $track[0][1];
-			$result->loops = 1 if @track > 2 && abs($dx) <= 1 && abs($dy) <= 1 && abs($dx + $dy) <= 1;
 		}
 
 		(my ($armnum), $sol) = unpack 'La*', $sol;
@@ -275,10 +279,19 @@ my %rotational_symmetry = (
 sub rotate_parts($parts, $rotation) {
 	my ($xfx, $yfx, $xfy, $yfy) = $xy_rotations[$rotation]->@*;
 	for my $part (@$parts) {
-		$part->rotation += $rotation;
 		my ($x, $y) = ($part->x, $part->y);
 		$part->x = $x * $xfx + $y * $xfy;
 		$part->y = $x * $yfx + $y * $yfy;
+		if ($part->name eq 'track') {
+			map {
+				my ($x, $y) = @$_;
+				$_->[0] = $x * $xfx + $y * $xfy;
+				$_->[1] = $x * $yfx + $y * $yfy;
+			} $part->track->@*;
+		}
+		else {
+			$part->rotation += $rotation;
+		}
 	}
 }
 
@@ -383,7 +396,7 @@ sub tape_length(@parts) {
 	return max map { $_->instructions =~ /\w.*/ ? length($&) : 0 } @parts;
 }
 
-sub execute_instruction($arm, $i, $track, $loops) {
+sub execute_instruction($arm, $i, $track, $loops = 0) {
 	$arm->size = min(3, $arm->size + 1) if $i eq 'E';
 	$arm->size = max(1, $arm->size - 1) if $i eq 'e';
 	$arm->rotation = ($arm->rotation - 1) % 6 if $i eq 'R';
@@ -434,36 +447,61 @@ sub normalize($parts) {
 	rotate_parts($parts, -$out->rotation);
 
 	# Track stuff
-	for my $part (grep { $_->track } @$parts) {
+	for my $part (@$parts) {
+		next unless $part->track;
 		my $track = $part->track;
-		my ($xfx, $yfx, $xfy, $yfy) = $xy_rotations[$part->rotation]->@*;
-		map {
-			my ($x, $y) = @$_;
-			$_->[0] = $x * $xfx + $y * $xfy;
-			$_->[1] = $x * $yfx + $y * $yfy;
-		} @$track;
-
+		my $loops = $part->loops;
 		my %points = map { ("@$_" => 1) } @$track;
 		my @arms_on_track = grep { $points{$_->xy} } @arms;
 
+		# make single arms start with a grab
 		if (@arms_on_track == 1) {
 			my $arm = $arms_on_track[0];
 			while ($arm->instructions =~ s/^\0*+\K[^G]/\0/) {
 				vec($arm->instructions, $-[0] + $tape_length, 8) = ord $&;
-				execute_instruction($arm, $&, $track, $part->loops);
+				execute_instruction($arm, $&, $track, $loops);
 			}
 		}
 
+		# unmerge unnecessarily merged tracks
+		elsif (all { $_->instructions =~ /A.*a|a.*A/ } @arms_on_track) {
+			my @used_segment = ();
+			for my $arm (@arms_on_track) {
+				my $track_pos = first { point_eq($$track[$_], [$arm->x, $arm->y]) } 0..$#$track;
+				while ($arm->instructions =~ /A/gi) {
+					$used_segment[++$track_pos] = 1 if $& eq 'A';
+					$used_segment[$track_pos--] = 1 if $& eq 'a';
+					$track_pos = $loops ? $track_pos % @$track : max(0, min($#$track, $track_pos));
+				}
+			}
+			$used_segment[0] = delete($used_segment[@$track]) && $loops;
+			my ($a, $b) = grep { !$used_segment[$_] } 0..$#$track;
+			if ($b) {
+				my @new_track = @$track[$b..$#$track, 0..$a-1];
+				push @$parts, Part::new('track', 0, 0, 1, 0, '', [@new_track]);
+				@$track = @$track[$a..$b-1];
+				%points = map { ("@$_" => 1) } @$track;
+				@arms_on_track = grep { $points{$_->xy} } @arms_on_track;
+			}
+		}
+
+		# reverse the track if most arms on it do - before +
 		if (0 < sum map { $_->instructions =~ /A/i ? (ord($&) - 81) * 2**-$-[0] : 0 } @arms_on_track) {
 			$_->instructions =~ y/Aa/aA/ for @arms_on_track;
 			@$track = reverse @$track;
 		}
 
-		# if ($_->loop)
-		# TODO normalize loop start point
-		# TODO unmerge unnecessarily merged tracks
+		# normalize trackloop start point
+		if ($loops) {
+			my @sorted_points = sort {
+				abs($$a[1]) <=> abs($$b[1]) ||
+				($$a[0] * 2 + $$a[1]) <=> ($$b[0] * 2 + $$b[1])
+			} @$track;
+			my $first = first { point_eq($$track[$_], $sorted_points[0]) } 0..$#$track;
+			@$track = @$track[$first..$#$track, 0..$first-1];
+		}
+
 		@$part[1, 2] = $track->[0]->@*;
-		$part->rotation = 0;
 	}
 
 	# Remove noops and start delay
@@ -545,8 +583,9 @@ sub minify($parts, $cycles) {
 	}
 
 	$_->name = $old_name;
-	if ($_->track and $_->track->@* > 2) {
-		my $track = $_->track;
+	my $track = $_->track;
+
+	if ($track and @$track > 2) {
 		my $segment = pop @$track;
 		return 1 if is_not_slower($parts, $cycles);
 		push @$track, $segment;
@@ -633,7 +672,7 @@ sub point_eq($a, $b) {
 	return $a->[0] == $b->[0] && $a->[1] == $b->[1];
 }
 
-sub merge_tracks($a, $b) {
+sub merge_tracks($a, $b, $map) {
 	my @a = $a->track->@*;
 	my @b = $b->track->@*;
 	my @pre = ();
@@ -651,6 +690,7 @@ sub merge_tracks($a, $b) {
 		}
 	}
 
+	map { $_ = $a if $_ == $b } $$map{"@$_"}->@* for @pre, @post;
 	$a->track = [@pre, @a, @post];
 	$b->deleted = 1;
 }
@@ -675,18 +715,18 @@ sub handle_tribonder_overlap($bonder, $tribonder) {
 	return $bonder->deleted = 1;
 }
 
-sub handle_overlap($a, $b, $parts) {
-	return 1 if $a->deleted;
+sub handle_overlap($a, $b, $parts, $map) {
+	return 1 if $a->deleted || $b->deleted || $a == $b;
 	my ($a_is_track, $a_is_arm) = ($a->name eq 'track', $a->name =~ /^(?:arm[1236]|piston)$/);
 	my ($b_is_track, $b_is_arm) = ($b->name eq 'track', $b->name =~ /^(?:arm[1236]|piston)$/);
 
 	if ($a_is_track && $b_is_track) {
-		return 1 if merge_tracks($a, $b);
+		return 1 if merge_tracks($a, $b, $map);
 		my %arm_to_track = compute_trackmap($parts);
 		my @arms_on_a = grep { ($arm_to_track{$_} // 0) == $a } @$parts;
 		$_->instructions =~ y/Aa/aA/ for @arms_on_a;
 		$a->track = [reverse $a->track->@*];
-		return merge_tracks($a, $b);
+		return merge_tracks($a, $b, $map);
 	}
 
 	if ($a_is_arm && $b_is_arm) {
@@ -748,7 +788,7 @@ sub deoverlap($parts) {
 		for my $point (part_points($part)) {
 			my $overlaps = ($map{"@$point"} //= []);
 			for (@$overlaps) {
-				my $result = handle_overlap($part, $_, $parts);
+				my $result = handle_overlap($part, $_, $parts, \%map);
 				return $result if !$result;
 			}
 			push @$overlaps, $part;
@@ -764,8 +804,8 @@ sub try_merge($half_a, $half_b) {
 	my @merged = deep_copy(@$half_a, @$half_b);
 	my $deoverlap_result = deoverlap(\@merged);
 	return if not defined $deoverlap_result;
-	my $pretty = omsim(\@merged) if $deoverlap_result;
-	return [@merged, $pretty] if $pretty;
+	my $score = omsim(\@merged) if $deoverlap_result;
+	return [@merged, $score] if $score;
 
 	my @result = ();
 	my @delayed = deep_copy(@$half_a);
@@ -774,9 +814,9 @@ sub try_merge($half_a, $half_b) {
 		$_->instructions =~ s/(?=\w)/\0/ for @delayed;
 		@merged = deep_copy(@delayed, @$half_b);
 		next unless deoverlap(\@merged);
-		$pretty = omsim(\@merged);
-		if ($pretty) {
-			push @result, [@merged, $pretty];
+		$score = omsim(\@merged);
+		if ($score) {
+			push @result, [@merged, $score];
 			last;
 		}
 	}
@@ -787,9 +827,9 @@ sub try_merge($half_a, $half_b) {
 		$_->instructions =~ s/(?=\w)/\0/ for @delayed;
 		@merged = deep_copy(@$half_a, @delayed);
 		next unless deoverlap(\@merged);
-		$pretty = omsim(\@merged);
-		if ($pretty) {
-			push @result, [@merged, $pretty];
+		$score = omsim(\@merged);
+		if ($score) {
+			push @result, [@merged, $score];
 			last;
 		}
 	}
@@ -797,29 +837,21 @@ sub try_merge($half_a, $half_b) {
 	return @result;
 }
 
-# TODO use better variable names here
-sub try_all_merges($a, $b) {
-	my $ola = tape_length(@$a);
-	my $olb = tape_length(@$b);
-	my ($la, $lb) = ($ola, $olb);
+sub try_all_merges(@halves) {
+	my @periods = map { tape_length(@$_) } @halves;
+	my @lengths = @periods;
+	my @results = try_merge(@halves);
+	return @results if uniq(@lengths) == 1;
 
-	my @results = try_merge($a, $b);
-	return @results if $la == $lb;
-
-	$a = [ deep_copy(@$a) ];
-	$b = [ deep_copy(@$b) ];
+	@halves = map [ deep_copy(@$_) ], @halves;
 
 	for (1..6) {
-		if ($la < $lb) {
-			add_repeats($a, $la);
-			$la += $ola;
-		} elsif ($la > $lb) {
-			add_repeats($b, $lb);
-			$lb += $olb;
-		}
-		push @results, try_merge($a, $b);
-		last if $la == $lb;
-		last if $la > 42 && $lb > 42;
+		my $index = $lengths[0] < $lengths[1] ? 0 : 1;
+		add_repeats($halves[$index], $lengths[$index]);
+		$lengths[$index] += $periods[$index];
+		push @results, try_merge(@halves);
+		last if uniq(@lengths) == 1;
+		last if all { $_ > 42 } @lengths;
 	}
 
 	return @results;
@@ -1053,8 +1085,8 @@ sub variantify(@parts) {
 			$variant[$i] = $part_variant;
 			unfold_tracked_arms(\@variant);
 			next unless deoverlap(\@variant);
-			my $pretty = omsim(\@variant);
-			push @variants, [@variant, $pretty] if $pretty;
+			my $score = omsim(\@variant);
+			push @variants, [@variant, $score] if $score;
 		}
 	}
 
@@ -1150,29 +1182,29 @@ if ($v) {
 	my ($cache_hit, $cache_miss) = (0, 0);
 
 	sub postprocess($parts) {
-		my $pretty = pop @$parts;
+		my $score = pop @$parts;
 		normalize($parts);
 		my $solution = parts_to_solution(@$parts);
 		my $md5 = md5_base64(parts_to_solution(@$parts)) =~ y(/)(_)r;
 		++$cache_hit, return if $known{$md5}++;
 		++$cache_miss;
 		say "$cache_hit hits, $cache_miss misses" if !($cache_miss & ($cache_miss - 1));
-		my $nplet = [$pretty =~ /[\d.]+/g];
+		my $nplet = [$score =~ /[\d.]+/g];
 		my $outV = count_outparetos($nplet, $MASK_V, \@nplets);
 		my $outINF = count_outparetos($nplet, $MASK_INF, \@nplets);
 		my $true_outs = min($outV, $outINF);
 		push $q[$true_outs]->@*, $parts if $true_outs < 4;
 		return if $true_outs;
 		my @names = name($nplet, \@nplets);
-		say "$pretty: ", join ', ', @names;
-		write_file("/home/grimy/Games/solutions/$pretty.solution", $solution, 1);
+		say "$score: ", join ', ', @names;
+		write_file("/home/grimy/Games/solutions/$score.solution", $solution, 1);
 		push @nplets, $nplet;
 	}
 
 	for my $file (<{solution,extra_solutions}/*.solution>) {
 		my @parts = solution_to_parts(slurp($file, 1));
-		my $pretty = omsim(\@parts);
-		push @parts, $pretty;
+		my $score = omsim(\@parts);
+		push @parts, $score;
 		postprocess(\@parts);
 	}
 
@@ -1194,6 +1226,29 @@ if ($v) {
 	}
 }
 
+for my $file (<solution/*.solution>) {
+	my @parts = solution_to_parts(slurp($file, 1));
+	my $score = omsim(\@parts);
+	die if $score !~ /\d+(?=c)/;
+	my $cycles = $&;
+	expand_instructions(@parts);
+	next unless any { length($_->instructions) > $cycles } @parts;
+	$_->instructions =~ s/g\K[^g]+$// for @parts;
+	my $tape_length = tape_length(@parts);
+	my $arm = first { $_->instructions =~ /^\w/ } @parts;
+	for ($tape_length .. $cycles + 1) {
+		vec($arm->instructions, $_ - 1, 8) ||= ord 'O';
+		$score = omsim(\@parts);
+		next unless $score;
+		my $nplet = [$score =~ /[\d.]+/g];
+		my $outV = count_outparetos($nplet, $MASK_V, \@nplets);
+		next if $outV;
+		my $solution = parts_to_solution(@parts);
+		say $score;
+		write_file("/home/grimy/Games/solutions/$score.solution", $solution, 1);
+	}
+}
+
 if (0) {
 	$puzzle = 'c400776884268947';
 	$part_points{'out-std'} = undef;
@@ -1208,10 +1263,10 @@ if (0) {
 	}
 
 	sub test_variants($name, $solve) {
-		my $pretty = omsim($solve);
+		my $score = omsim($solve);
 		my @variants = variantify(@$solve);
 		my $arm_counts = count_arms(@variants);
-		printf "%-16s %-36s %s\n", $name, $pretty, $arm_counts;
+		printf "%-16s %-36s %s\n", $name, $score, $arm_counts;
 		for my $variant (@variants) {
 			pop @$variant;
 			my $variant_arm_counts = count_arms(variantify(@$variant));
@@ -1315,9 +1370,9 @@ if (0) {
 
 	for my $file (<normalized/*.solution>) {
 		my @parts = solution_to_parts(slurp($file, 1));
-		my $pretty = omsim(\@parts);
-		$bsm{$file} = $pretty;
-		push $score_map{$pretty}->@*, $file;
+		my $score = omsim(\@parts);
+		$bsm{$file} = $score;
+		push $score_map{$score}->@*, $file;
 		$_->instructions = '' for @parts;
 		my $solution = parts_to_solution(@parts);
 		my $md5 = md5_base64($solution) =~ y(/)(_)r;
@@ -1333,5 +1388,12 @@ if (0) {
 			say "* duped layout:";
 			say "** $_ = $bsm{$_}" for @{$layout_map{$_}};
 		}
+	}
+}
+
+if (0) {
+	for my $file (<normalized/*.solution>) {
+		my @parts = solution_to_parts(slurp($file, 1));
+		say omsim(\@parts);
 	}
 }
