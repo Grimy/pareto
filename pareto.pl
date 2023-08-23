@@ -755,6 +755,7 @@ sub handle_overlap($a, $b, $parts, $map) {
 	}
 
 	return 1 if ($a_is_track && $b_is_arm) || ($a_is_arm && $b_is_track);
+	return 1 if ($a->name . ' ' . $b->name) =~ /^input out-std$|^out-std input$/;
 	return handle_tribonder_overlap($a, $b) if $a->name eq 'bonder' && $b->name eq 'bonder-speed';
 	return handle_tribonder_overlap($b, $a) if $b->name eq 'bonder' && $a->name eq 'bonder-speed';
 	return if $a->name ne $b->name;
@@ -834,7 +835,10 @@ sub try_merge($half_a, $half_b) {
 	return @result;
 }
 
+
 sub try_all_merges(@halves) {
+	state %half_score;
+
 	my @periods = map { tape_length(@$_) } @halves;
 	my @lengths = @periods;
 	my @results = try_merge(@halves);
@@ -842,7 +846,40 @@ sub try_all_merges(@halves) {
 
 	@halves = map [ deep_copy(@$_) ], @halves;
 
-	for (1..6) {
+	if ($periods[0] > $periods[1]) {
+		@periods = reverse @periods;
+		@lengths = reverse @lengths;
+		@halves = reverse @halves;
+	}
+
+	my @scores = map { $half_score{$_} //= omsim($_) } @halves;
+	# if ($periods[0] == 5 && $periods[1] == 6) {
+		# my ($c5) = $scores[0] =~ /(\d+)c/;
+		# my ($c6) = $scores[1] =~ /(\d+)c/;
+		# add_repeats($halves[0], 5);
+		# add_repeats($halves[0], 10);
+		# add_repeats($halves[0], 15);
+		# my %bad = map { $c5 - 5 * $_ => 1 } 0..5;
+		# $c6 -= 30;
+		# my $pos = 6;
+		# if ($bad{$c6}) {
+			# $_->instructions =~ s/(?=\w)/\0/ for $halves[1]->@*;
+		# }
+		# ++$pos if $bad{$c6 + $pos};
+		# add_repeats($halves[1], $pos);
+		# $pos += 6;
+		# ++$pos if $bad{$c6 + $pos};
+		# add_repeats($halves[1], $pos);
+		# push @results, try_merge(@halves);
+		# add_repeats($halves[0], 20);
+		# $pos += 6;
+		# ++$pos if $bad{$c6 + $pos};
+		# add_repeats($halves[1], $pos);
+		# push @results, try_merge(@halves);
+		# return @results;
+	# }
+
+	for (1..14) {
 		my $index = $lengths[0] < $lengths[1] ? 0 : 1;
 		add_repeats($halves[$index], $lengths[$index]);
 		$lengths[$index] += $periods[$index];
@@ -857,8 +894,8 @@ sub try_all_merges(@halves) {
 sub save_and_check(@parts) {
 	my $solution = parts_to_solution(@parts);
 	my $md5 = md5_base64($solution) =~ y(/)(_)r;
-	return $md5 if -f "normalized/$md5.solution";
-	write_file("normalized/$md5.solution", $solution, 1);
+	return $md5 if -f "halves/$md5.solution";
+	write_file("halves/$md5.solution", $solution, 1);
 
 	normalize(\@parts);
 	die "normalizing broke solve: $md5" if not omsim(\@parts);
@@ -917,8 +954,8 @@ sub part_variants($part, $would_shorten_tape) {
 	# Multi-arms can be converted to single arms, but nothing else
 	if ($part->name =~ /^arm([236])$/) {
 		return map {
-			Part::new('arm1', $part->x, $part->y, $part->size,
-				$part->rotation + $_ * (6 / $1), $instructions =~ y/gO/X\0/r, $part->track);
+			Part::new('arm1', $part->x, $part->y, $part->size, $part->rotation + $_ * (6 / $1),
+				$instructions =~ s/g[^G]*/'X' . "\0" x (length($&) - 1)/gre, $part->track);
 		} 1..$1;
 	}
 
@@ -969,12 +1006,12 @@ sub part_variants($part, $would_shorten_tape) {
 		for my $size (1..3) {
 			my ($x, $y) = grab_point($points[0][0], $points[0][1], -$size, $rotation);
 			for (arms_for_points(Part::new('arm1', $x, $y, $size, $rotation, ''), @points)) {
-				my $dr = $_->rotation - $rotation;
-				my $grippers = ($dr % 2 ? 2 : 1) * ($dr % 3 ? 3 : 1);
 				if ($require_loops) {
+					my $dr = $_->rotation - $rotation;
+					my $grippers = ($dr % 2 ? 2 : 1) * ($dr % 3 ? 3 : 1);
 					next if $_->x != $x || $_->y != $y || $_->size != $size;
 					next if $_->name eq 'piston' && $grippers > 1;
-					$_->name = "arm$grippers";
+					$_->name = "arm$grippers" if $grippers > 1;
 				}
 
 				my @plus = $_->instructions =~ /./g;
@@ -985,13 +1022,19 @@ sub part_variants($part, $would_shorten_tape) {
 					$& eq '>' ? $plus[$state++] : $minus[--$state]
 				}gre;
 				push @arms, Part::new($_->name, $x, $y, $size, $rotation, $instrs, $_->track);
-				if ($_->name eq 'arm1' && $grippers > 1) {
-					$instrs =~ s(g\K[^gG]*)($&=~y/></\0\0/r)eg;
-					push @arms, Part::new("arm$grippers", $x, $y, $size, $rotation, $instrs, $_->track);
-					next unless $would_shorten_tape;
-					$instrs =~ s/\0$/O/;
-					push @arms, Part::new("arm$grippers", $x, $y, $size, $rotation, $instrs, $_->track);
-				}
+				next unless $_->name eq 'arm1';
+				my $grippers = 1;
+				$instrs =~ s{g\K[^gG]*}{
+					my $result = $&;
+					my $dr = ($result =~ y/Rr//d);
+					$grippers *= 2 if $dr % 2 && $grippers % 2;
+					$grippers *= 3 if $dr % 3 && $grippers % 3;
+					$result . "\0" x $dr;
+				}eg;
+				next unless $grippers > 1;
+				push @arms, Part::new("arm$grippers", $x, $y, $size, $rotation, $instrs, $_->track);
+				next unless $would_shorten_tape && $instrs =~ s/\0$/O/;
+				push @arms, Part::new("arm$grippers", $x, $y, $size, $rotation, $instrs, $_->track);
 			}
 		}
 	}
@@ -1126,7 +1169,7 @@ if ($n) {
 }
 
 if ($g) {
-	my %old_md5 = map { /\/(.*?)\./; $1 => 1 } <normalized/*.solution>;
+	my %old_md5 = map { /\/(.*?)\./; $1 => 1 } <halves/*.solution>;
 	my %new_md5 = ();
 
 	for my $file (<{solution,extra_solutions}/*.solution>) {
@@ -1171,7 +1214,7 @@ if ($g) {
 if ($v) {
 	my %known = ();
 	my @q = ([]);
-	my @halves = map [solution_to_parts(slurp($_, 1))], <normalized/*.solution>;
+	my @halves = map [solution_to_parts(slurp($_, 1))], <halves/*.solution>;
 
 	my ($cache_hit, $cache_miss) = (0, 0);
 
@@ -1187,7 +1230,7 @@ if ($v) {
 		my $outV = count_outparetos($nplet, $MASK_V, \@nplets);
 		my $outINF = count_outparetos($nplet, $MASK_INF, \@nplets);
 		my $true_outs = min($outV, $outINF);
-		push $q[$true_outs]->@*, $parts if $true_outs < 4;
+		push $q[$true_outs]->@*, $parts if $true_outs < 6;
 		return if $true_outs;
 		my @names = name($nplet, \@nplets);
 		say "$score: ", join ', ', @names;
@@ -1196,26 +1239,35 @@ if ($v) {
 	}
 
 	for my $file (<{solution,extra_solutions}/*.solution>) {
+		next unless -M $file < 0.25;
+		say $file;
 		my @parts = solution_to_parts(slurp($file, 1));
 		my $score = omsim(\@parts);
 		push @parts, $score;
 		postprocess(\@parts);
 	}
 
+	my @new_halves = map [solution_to_parts(slurp($_, 1))], <new/*.solution>;
+
 	warn "merging...";
-	for (0..$#halves) {
-		my $a = $halves[$_];
-		postprocess($_) for map { try_all_merges($a, $_) } @halves[$_..$#halves];
+	for my $a (@new_halves) {
+		postprocess($_) for map { try_all_merges($a, $_) } @halves, @new_halves;
 		mirror_parts($a);
-		postprocess($_) for map { try_all_merges($a, $_) } @halves[$_..$#halves];
+		postprocess($_) for map { try_all_merges($a, $_) } @halves, @new_halves;
 	}
+
+	# for (0..$#halves) {
+		# my $a = $halves[$_];
+		# postprocess($_) for map { try_all_merges($a, $_) } @halves[$_..$#halves];
+		# mirror_parts($a);
+		# postprocess($_) for map { try_all_merges($a, $_) } @halves[$_..$#halves];
+	# }
 
 	warn "variantifying...";
 	my $count = 0;
 	while (my $entry = first { @$_ } @q) {
 		my $parts = shift @$entry;
-		++$count;
-		say "$count: ", join ', ', map { 0+@$_ } @q if !($count & ($count - 1));
+		say "$count: ", join ', ', map { 0+@$_ } @q if !($count++ & 511);
 		postprocess($_) for variantify(@$parts);
 	}
 }
@@ -1262,8 +1314,7 @@ if (0) {
 		my $arm_counts = count_arms(@variants);
 		printf "%-16s %-36s %s\n", $name, $score, $arm_counts;
 		for my $variant (@variants) {
-			pop @$variant;
-			# normalize($variant);
+			my $variant_score = pop @$variant;
 			my $variant_arm_counts = count_arms(variantify(@$variant));
 			my $has_track = any { $_->name eq 'track' } @$variant;
 			my $has_multiarm = any { $_->name =~ /^arm[236]$/ } @$variant;
@@ -1371,7 +1422,7 @@ if (0) {
 	my %layout_map = ();
 	my %bsm = ();
 
-	for my $file (<normalized/*.solution>) {
+	for my $file (<halves/*.solution>) {
 		my @parts = solution_to_parts(slurp($file, 1));
 		my $score = omsim(\@parts);
 		$bsm{$file} = $score;
@@ -1394,9 +1445,10 @@ if (0) {
 	}
 }
 
-if (0) {
-	for my $file (<normalized/*.solution>) {
-		my @parts = solution_to_parts(slurp($file, 1));
-		say omsim(\@parts);
-	}
+my @map = ();
+for my $file (<solution/*.solution>) {
+	my @parts = solution_to_parts(slurp($file, 1));
+	my $arm_count = grep { $_->instructions } @parts;
+	++$map[$arm_count];
 }
+say "@map";
