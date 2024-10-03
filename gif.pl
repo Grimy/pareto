@@ -28,6 +28,7 @@ for my $file (<output/*.solution>) {
 	my $brackets = /lexC bracket length is (\d+)/ ? $1 : 0;
 	my $start = 0;
 	my $end = $cycles + 1;
+	my $tries = 3;
 
 	if ($outputs) {
 		$start = /start cycle is (\d+)/ ? $1 : 0;
@@ -42,11 +43,16 @@ for my $file (<output/*.solution>) {
 		}
 		$start -= $length while $start > $cycles + $length;
 		$end = $start + $length;
+		$tries = 1;
 	}
 
 	# next if ($end - 0.9 * $start) > 2048;
 	say "$file: $start $end";
 	chdir("$ENV{HOME}/.local/share/Steam/steamapps/common/Opus Magnum") or die;
-	`./ModdedLightning.bin.x86_64 '$path' out='$out' start='$start' end='$end'`;
+	for (1..$tries) {
+		`./ModdedLightning.bin.x86_64 '$path' out='$out' start='$start' end='$end'`;
+		last if -f $out;
+		--$end;
+	}
 	chdir($dir) or die;
 }
